@@ -105,6 +105,7 @@ pub fn edge_config() -> &'static EdgeConfig {
 }
 
 pub fn parser() -> LiteParse {
+    #[allow(clippy::needless_update)]
     LiteParse::new(LiteParseConfig {
         ocr_enabled: false,
         ocr_language: "eng".into(),
