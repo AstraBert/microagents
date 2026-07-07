@@ -118,6 +118,7 @@ pub fn parser() -> LiteParse {
         preserve_very_small_text: false,
         quiet: true,
         num_workers: 1,
+        ..Default::default()
     })
 }
 
