@@ -1,8 +1,8 @@
+use llms_sdk::{LLMStreamingResponse, Tool as SdkTool};
 use microagents_events::{AgentEventAny, types::ToolResult};
 use serde_json::Value;
 use std::{env::VarError, fmt::Debug, pin::Pin, sync::Arc};
 use thiserror::Error;
-use ultrafast_models_sdk::models::{Function, StreamChunk, Tool};
 
 use crate::agent::MicroAgentBuilderError;
 
@@ -41,10 +41,12 @@ pub enum AgentError {
     TokenizerLoadingError(String),
     #[error("Error loading tasks: {0}")]
     TaskLoadingError(String),
+    #[error("Error while converting tool to sdk tool: {0}")]
+    ToolConversionError(String),
 }
 
 /// A single item yielded by a [`GenerationStream`].
-pub type StreamItem = Result<StreamChunk, AgentError>;
+pub type StreamItem = Result<LLMStreamingResponse, AgentError>;
 /// Stream of raw LLM chunks returned by [`Agent::generate`].
 pub type GenerationStream = Pin<Box<dyn futures_core::Stream<Item = StreamItem> + Send>>;
 /// A single event yielded by a [`RunStream`].
@@ -60,7 +62,7 @@ pub type RunStream = Pin<Box<dyn futures_core::Stream<Item = RunStreamItem> + Se
 #[async_trait::async_trait]
 pub trait Agent: Send + Sync {
     /// Generate the next assistant response as a raw token stream.
-    async fn generate(&mut self, sticky_session_id: &str) -> Result<GenerationStream, AgentError>;
+    async fn generate(&mut self) -> Result<GenerationStream, AgentError>;
     /// Run a complete conversation turn, optionally resuming an existing session.
     async fn run(
         mut self,
@@ -110,15 +112,15 @@ pub trait ToolFunction<Ctx>: Debug + Send + Sync {
         ctx: &Arc<ToolExecutionContext<Ctx>>,
     ) -> Result<ToolResult, AgentError>;
     /// Convert this tool into the SDK representation used for chat requests.
-    fn to_sdk_tool(&self) -> Tool {
-        Tool {
-            tool_type: "function".into(),
-            function: Function {
-                name: self.name().to_owned(),
-                description: Some(self.description().to_owned()),
-                parameters: self.input_schema(),
-            },
-        }
+    fn to_sdk_tool(&self) -> Result<SdkTool, AgentError> {
+        Ok(SdkTool {
+            name: self.name().to_string(),
+            description: self.description().to_string(),
+            parameters: self
+                .input_schema()
+                .try_into()
+                .map_err(|e: serde_json::Error| AgentError::ToolConversionError(e.to_string()))?,
+        })
     }
 }
 
@@ -142,7 +144,30 @@ mod tests {
         }
 
         fn input_schema(&self) -> Value {
-            json!({})
+            json!({
+              "$schema": "https://json-schema.org/draft-07/schema",
+              "type": "object",
+              "properties": {
+                "hobbies": {
+                  "type": "array",
+                  "description": "List of hobbies",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "description": "Name of the hobby"
+                      },
+                      "yearsExperience": {
+                        "type": "number",
+                        "description": "Years of experience"
+                      }
+                    }
+                  }
+                }
+              },
+              "required": []
+            })
         }
 
         async fn execute(
@@ -157,13 +182,11 @@ mod tests {
     #[test]
     fn test_to_sdk_tool() {
         let tool = MyTool {};
-        let sdk_tool = tool.to_sdk_tool();
-        assert_eq!(sdk_tool.tool_type, "function".to_string());
-        assert_eq!(sdk_tool.function.name, tool.name().to_owned());
-        assert_eq!(
-            sdk_tool.function.description,
-            Some(tool.description().to_owned())
-        );
-        assert_eq!(sdk_tool.function.parameters, tool.input_schema());
+        let sdk_tool = tool
+            .to_sdk_tool()
+            .expect("Should be able to convert to tool");
+        assert_eq!(sdk_tool.name, tool.name().to_owned());
+        assert_eq!(sdk_tool.description, tool.description().to_owned());
+        assert_eq!(sdk_tool.parameters, tool.input_schema());
     }
 }

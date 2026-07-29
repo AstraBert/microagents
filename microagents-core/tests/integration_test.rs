@@ -56,13 +56,13 @@ impl ToolFunction<()> for WeatherTool {
 }
 
 #[tokio::test]
-async fn test_microagent_integration() {
+async fn test_microagent_integration_openai() {
     match std::env::var("OPENAI_API_KEY") {
         Ok(_) => {}
         Err(_) => return,
     }
     let agent = MicroAgentBuilder::<()>::new(ToolExecutionContext::<()>::new(()))
-        .model("gpt-5.1")
+        .model("gpt-5.4-mini")
         .provider("openai".to_string())
         .expect("Should load provider")
         .custom_instructions("Always call the weather_tool when asked about the weather")
@@ -97,7 +97,7 @@ async fn test_microagent_integration() {
                 has_init = true;
                 assert_eq!(e.init_type, SessionInitType::Start);
                 assert_eq!(e.provider, "openai");
-                assert_eq!(e.model, "gpt-5.1");
+                assert_eq!(e.model, "gpt-5.4-mini");
             }
             AgentEventAny::AssistantResponse(_) => has_assistant_response = true,
             AgentEventAny::StreamDelta(_) => has_stream = true,
@@ -131,25 +131,81 @@ async fn test_microagent_integration() {
     assert!(!has_skill);
 }
 
-#[test]
-fn test_sticky_sessions() {
-    match std::env::var("OPENROUTER_API_KEY") {
+#[tokio::test]
+async fn test_microagent_integration_anthropic() {
+    match std::env::var("ANTHROPIC_API_KEY") {
         Ok(_) => {}
         Err(_) => return,
     }
-    let mut agent = MicroAgentBuilder::<()>::new(ToolExecutionContext::<()>::new(()))
-        .model("openrouter/owl-alpha")
-        .provider("openrouter".to_string())
+    let agent = MicroAgentBuilder::<()>::new(ToolExecutionContext::<()>::new(()))
+        .model("claude-sonnet-5")
+        .provider("anthropic".to_string())
         .expect("Should load provider")
+        .custom_instructions("Always call the weather_tool when asked about the weather")
+        .add_tool(Arc::new(WeatherTool))
+        .expect("Should be able to register tool")
         .build()
         .expect("Should be able to build the agent");
-    let _ = agent
-        .init_client("session-1")
-        .expect("Should be able to init client");
-    let _ = agent
-        .init_client("session-2")
-        .expect("Should be able to init client");
-    assert_eq!(agent.openrouter_clients.len(), 2);
-    assert!(agent.openrouter_clients.contains_key("session-1"));
-    assert!(agent.openrouter_clients.contains_key("session-2"));
+    let mut events = vec![];
+    let mut stream = agent
+        .run("What is the weather in San Francisco?".into(), None)
+        .await
+        .unwrap();
+    while let Some(e) = stream.next().await {
+        match e {
+            Ok(ev) => {
+                println!("{:#?}", ev);
+                events.push(ev)
+            }
+            Err(err) => panic!("{}", err.to_string()),
+        }
+    }
+    // session init + user prompt submit + tool call + assistant response + stop
+    assert!(events.len() >= 5);
+    let mut has_init = false;
+    let mut has_user_prompt_submit = false;
+    let mut has_assistant_response = false;
+    let mut has_tool_call = false;
+    let mut has_tool_result = false;
+    let mut has_stop = false;
+    let mut has_stream = false;
+    let mut has_skill = false; // this should be false
+    for ev in events {
+        match ev {
+            AgentEventAny::SessionInit(e) => {
+                has_init = true;
+                assert_eq!(e.init_type, SessionInitType::Start);
+                assert_eq!(e.provider, "anthropic");
+                assert_eq!(e.model, "claude-sonnet-5");
+            }
+            AgentEventAny::AssistantResponse(_) => has_assistant_response = true,
+            AgentEventAny::StreamDelta(_) => has_stream = true,
+            AgentEventAny::ToolCall(_) => has_tool_call = true,
+            AgentEventAny::ToolResult(e) => {
+                has_tool_result = true;
+                assert!(
+                    matches!(e.result, ToolResult::Ok(ref res) if res == "Weather in San Francisco is sunny with 27 degrees Celsius.")
+                )
+            }
+            AgentEventAny::UserPromptSubmit(e) => {
+                has_user_prompt_submit = true;
+                assert_eq!(e.prompt, "What is the weather in San Francisco?");
+            }
+            AgentEventAny::SessionStop(e) => {
+                has_stop = true;
+                assert!(e.result.is_some());
+                assert!(e.error.is_none());
+            }
+            AgentEventAny::SkillLoad(_) => has_skill = true,
+            _ => unreachable!("AgentEventAny should not reach this branch"),
+        }
+    }
+    assert!(has_init);
+    assert!(has_user_prompt_submit);
+    assert!(has_tool_call);
+    assert!(has_tool_result);
+    assert!(has_stream);
+    assert!(has_assistant_response);
+    assert!(has_stop);
+    assert!(!has_skill);
 }

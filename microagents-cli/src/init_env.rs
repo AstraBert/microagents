@@ -2,7 +2,6 @@ use ignore::WalkBuilder;
 use indicatif::ProgressIterator;
 use liteparse::{LiteParse, LiteParseConfig};
 use microagents_core::agent::SupportedProvider;
-use microagents_core::common::tokenizer;
 use microagents_core::types::AgentError;
 use qdrant_edge::{
     AnyVariants, Condition, Distance, EdgeConfig, EdgeShard, EdgeSparseVectorParams,
@@ -537,10 +536,6 @@ pub async fn initialize_environment(
     }
 
     let _ = edge_config();
-    if verbose {
-        println!("Loading tokenizer for token estimation...");
-    }
-    let _ = tokenizer().as_ref()?;
 
     let files = collect_files()?;
     if verbose {

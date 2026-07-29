@@ -25,7 +25,9 @@ use std::{
 use futures_util::StreamExt;
 use ignore::WalkBuilder;
 use microagents_core::types::{AgentError, RunStream};
-use microagents_events::{AgentEventAny, DeltaType, TaskStatus, types::ToolResult};
+use microagents_events::{
+    AgentEventAny, AssistantMessagePart, DeltaType, TaskStatus, ToolCallPart, types::ToolResult,
+};
 use ratatui::{
     Frame, Terminal,
     crossterm::{
@@ -412,11 +414,12 @@ impl App {
                     self.push(Msg::Error(err));
                 }
                 self.push(Msg::Session(format!(
-                    "session stopped • {} • {:?}s • {:?} est. input tokens • {:?} est. output tokens",
+                    "session stopped • {} • {:?}s • {:?} input toks ({:?} cached) • {:?} output toks",
                     if s.success { "ok" } else { "failed" },
                     s.usage.latency as f64 / 1000_f64,
-                    s.usage.estimated_input_tokens,
-                    s.usage.estimated_output_tokens,
+                    s.usage.input_tokens,
+                    s.usage.cache_read_tokens,
+                    s.usage.output_tokens,
                 )));
             }
             AgentEventAny::UserPromptSubmit(m) => {
@@ -441,15 +444,23 @@ impl App {
                 // Streamed text is already rendered via deltas. The core does
                 // not currently emit `tool.call` events, so derive them from
                 // the final assistant response's `tool_calls` field.
-                if let Some(calls) = r.tool_calls {
+                let mut tool_calls: Option<Vec<ToolCallPart>> = None;
+                for part in r.content {
+                    match part {
+                        AssistantMessagePart::ToolCall(t) => {
+                            tool_calls.get_or_insert_with(Vec::new).push(t)
+                        }
+                        _ => continue,
+                    }
+                }
+                if let Some(calls) = tool_calls {
                     for c in calls {
-                        let input =
-                            serde_json::from_str::<serde_json::Value>(&c.function.arguments)
-                                .ok()
-                                .and_then(|v| serde_json::to_string(&v).ok())
-                                .unwrap_or(c.function.arguments);
+                        let input = serde_json::from_str::<serde_json::Value>(&c.arguments)
+                            .ok()
+                            .and_then(|v| serde_json::to_string(&v).ok())
+                            .unwrap_or(c.arguments);
                         self.push(Msg::ToolCall {
-                            name: c.function.name,
+                            name: c.name,
                             input,
                         });
                     }
