@@ -323,6 +323,10 @@ impl<Ctx: Send + Sync + 'static> MicroAgentBuilder<Ctx> {
     ///
     /// Searches the configured project skills directory first, then
     /// `~/.agents/skills/{name}`.
+    ///
+    /// Call [`Self::skills_path`] before this method when using a non-default
+    /// project skills directory. Registered skills are not re-resolved if the
+    /// path changes later.
     pub fn add_skill(
         mut self,
         skill_name: impl Into<String>,
@@ -341,6 +345,10 @@ impl<Ctx: Send + Sync + 'static> MicroAgentBuilder<Ctx> {
 
     /// Auto-discover and register all skills found in the configured project
     /// and global skills directories.
+    ///
+    /// Call [`Self::skills_path`] before this method when using a non-default
+    /// project skills directory. Discovered skills are not re-resolved if the
+    /// path changes later.
     pub fn find_skills(mut self) -> Result<Self, MicroAgentBuilderError> {
         let loaded_skills = find_skills_with_project_path(&self.skills_path)?;
         for (skill, des) in loaded_skills {
