@@ -8,7 +8,7 @@ use std::{convert::TryFrom, fmt};
 
 use crate::types::{AgentEvent, AgentEventError, JsonRpcNotification, ToolResult};
 
-pub const EVENTS_PROTOCOL_VERSION: &str = "0.3.0";
+pub const EVENTS_PROTOCOL_VERSION: &str = "0.4.0";
 
 /// Indicates whether a session is being started fresh or resumed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +139,18 @@ pub struct ToolCallEvent {
     pub session_id: String,
     pub turn_id: String,
     pub name: String,
+    pub tool_call_id: String,
+    pub input: Value,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Event emitted when any tool (generic, skill or tasks) is called.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallAnyEvent {
+    pub session_id: String,
+    pub turn_id: String,
+    pub name: String,
+    pub tool_call_id: String,
     pub input: Value,
     pub timestamp: DateTime<Utc>,
 }
@@ -293,6 +305,16 @@ impl AgentEvent for ToolCallEvent {
     }
 }
 
+impl AgentEvent for ToolCallAnyEvent {
+    fn to_jsonrpc(&self) -> JsonRpcNotification {
+        serialize_to_jsonrpc("tool.any_call", self)
+    }
+
+    fn session_id(&self) -> String {
+        self.session_id.clone()
+    }
+}
+
 impl AgentEvent for ToolResultEvent {
     fn to_jsonrpc(&self) -> JsonRpcNotification {
         serialize_to_jsonrpc("tool.result", self)
@@ -358,6 +380,8 @@ pub enum AgentEventAny {
     Task(TaskEvent),
     #[serde(rename = "session.fork")]
     SessionFork(SessionForkEvent),
+    #[serde(rename = "tool.any_call")]
+    ToolAnyCall(ToolCallAnyEvent),
 }
 
 impl AgentEventAny {
@@ -370,6 +394,7 @@ impl AgentEventAny {
             Self::StreamDelta(s) => s.timestamp,
             Self::UserPromptSubmit(s) => s.timestamp,
             Self::ToolCall(s) => s.timestamp,
+            Self::ToolAnyCall(s) => s.timestamp,
             Self::ToolResult(s) => s.timestamp,
             Self::Task(s) => s.timestamp,
             Self::SessionFork(s) => s.timestamp,
@@ -385,6 +410,7 @@ impl AgentEventAny {
             Self::StreamDelta(s) => s.session_id = sid,
             Self::UserPromptSubmit(s) => s.session_id = sid,
             Self::ToolCall(s) => s.session_id = sid,
+            Self::ToolAnyCall(s) => s.session_id = sid,
             Self::ToolResult(s) => s.session_id = sid,
             Self::Task(s) => s.session_id = sid,
             Self::SessionFork(s) => s.session_id = sid,
@@ -400,6 +426,7 @@ impl AgentEvent for AgentEventAny {
             Self::SessionStop(e) => e.to_jsonrpc(),
             Self::StreamDelta(e) => e.to_jsonrpc(),
             Self::ToolCall(e) => e.to_jsonrpc(),
+            Self::ToolAnyCall(e) => e.to_jsonrpc(),
             Self::ToolResult(e) => e.to_jsonrpc(),
             Self::AssistantResponse(e) => e.to_jsonrpc(),
             Self::SkillLoad(e) => e.to_jsonrpc(),
@@ -417,6 +444,7 @@ impl AgentEvent for AgentEventAny {
             Self::StreamDelta(s) => s.session_id.clone(),
             Self::SkillLoad(s) => s.session_id.clone(),
             Self::ToolCall(s) => s.session_id.clone(),
+            Self::ToolAnyCall(s) => s.session_id.clone(),
             Self::ToolResult(s) => s.session_id.clone(),
             Self::UserPromptSubmit(s) => s.session_id.clone(),
             Self::Task(s) => s.session_id.clone(),
@@ -570,11 +598,13 @@ mod tests {
             name: "read".into(),
             input: json!({"path": "/tmp"}),
             timestamp: Utc::now(),
+            tool_call_id: "tc1".to_string(),
         };
         let rpc = event.to_jsonrpc();
         assert_eq!(rpc.method, "tool.call");
         assert_eq!(rpc.params.get("name"), Some(&Value::from("read")));
         assert_eq!(rpc.params.get("input"), Some(&json!({"path": "/tmp"})));
+        assert_eq!(rpc.params.get("tool_call_id"), Some(&Value::from("tc1")));
     }
 
     #[test]
@@ -813,6 +843,7 @@ mod tests {
             .add_param("turn_id".into(), Value::from("t1"))
             .add_param("name".into(), Value::from("read"))
             .add_param("input".into(), json!({"path": "/tmp"}))
+            .add_param("tool_call_id".into(), Value::from("tc1"))
             .add_param("timestamp".into(), {
                 let tms = Utc::now();
                 serde_json::to_value(tms).expect("Should convert to value")

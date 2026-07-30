@@ -5,6 +5,7 @@ use microagents_core::types::AgentError;
 use microagents_core::types::ToolExecutionContext;
 use microagents_core::types::ToolFunction;
 use microagents_events::AgentEventAny;
+use microagents_events::AssistantMessagePart;
 use microagents_events::SessionInitType;
 use microagents_events::types::ToolResult;
 use serde_json::{Value, json};
@@ -153,10 +154,7 @@ async fn test_microagent_integration_anthropic() {
         .unwrap();
     while let Some(e) = stream.next().await {
         match e {
-            Ok(ev) => {
-                println!("{:#?}", ev);
-                events.push(ev)
-            }
+            Ok(ev) => events.push(ev),
             Err(err) => panic!("{}", err.to_string()),
         }
     }
@@ -178,7 +176,12 @@ async fn test_microagent_integration_anthropic() {
                 assert_eq!(e.provider, "anthropic");
                 assert_eq!(e.model, "claude-sonnet-5");
             }
-            AgentEventAny::AssistantResponse(_) => has_assistant_response = true,
+            AgentEventAny::AssistantResponse(ar) => {
+                has_assistant_response = true;
+                assert!(ar.content.iter().any(
+                    |t| matches!(t, AssistantMessagePart::ToolCall(tc) if tc.name == "weather_tool")
+                ))
+            }
             AgentEventAny::StreamDelta(_) => has_stream = true,
             AgentEventAny::ToolCall(_) => has_tool_call = true,
             AgentEventAny::ToolResult(e) => {

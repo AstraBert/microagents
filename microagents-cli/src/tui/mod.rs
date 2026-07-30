@@ -414,7 +414,7 @@ impl App {
                     self.push(Msg::Error(err));
                 }
                 self.push(Msg::Session(format!(
-                    "session stopped • {} • {:?}s • {:?} input toks ({:?} cached) • {:?} output toks",
+                    "session stopped • {} • {:.2}s • {:?} input toks ({:?} cached) • {:?} output toks",
                     if s.success { "ok" } else { "failed" },
                     s.usage.latency as f64 / 1000_f64,
                     s.usage.input_tokens,

@@ -36,6 +36,15 @@ pub fn convert_event_to_message(event: AgentEventAny) -> Option<Message> {
             role: MessageRole::User,
             content: vec![MessagePart::Text(TextPart::new(p.prompt))],
         }),
+        AgentEventAny::ToolAnyCall(tc) => Some(Message {
+            role: MessageRole::Assistant,
+            content: vec![MessagePart::ToolCall(ToolCallPart {
+                id: tc.tool_call_id.clone(),
+                name: tc.name.clone(),
+                arguments: serde_json::to_string(&tc.input)
+                    .expect("Arguments should be serializable"),
+            })],
+        }),
         AgentEventAny::AssistantResponse(p) => {
             let mut content: Vec<MessagePart> = vec![];
             for c in p.content {
@@ -194,9 +203,10 @@ mod tests {
     use microagents_events::{
         AssistantResponseEvent, SessionInitEvent, SessionInitType, SessionStopEvent,
         SkillLoadEvent, StreamDeltaEvent, TaskEvent, TaskStatus, TextPart as AssistantTextPart,
-        ToolCallEvent, ToolCallPart as AssistantToolCallPart, ToolResultEvent, Usage,
-        UserPromptSubmitEvent,
+        ToolCallAnyEvent, ToolCallEvent, ToolCallPart as AssistantToolCallPart, ToolResultEvent,
+        Usage, UserPromptSubmitEvent,
     };
+    use serde_json::json;
 
     #[test]
     fn test_convert_user_prompt_submit() {
@@ -296,6 +306,24 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_tool_call_to_message() {
+        let msg = convert_event_to_message(AgentEventAny::ToolAnyCall(ToolCallAnyEvent {
+            session_id: "s1".into(),
+            turn_id: "t1".into(),
+            name: "tool".into(),
+            input: json!({}),
+            timestamp: Utc::now(),
+            tool_call_id: "tc1".to_string(),
+        }))
+        .expect("Should convert to a non-null message");
+        assert_eq!(msg.role, MessageRole::Assistant);
+        let first = msg.content.first().unwrap();
+        assert!(
+            matches!(first, MessagePart::ToolCall(tc) if tc.name == "tool" && tc.id == "tc1" && tc.arguments == "{}")
+        )
+    }
+
+    #[test]
     fn test_convert_other_events_return_none() {
         assert!(
             convert_event_to_message(AgentEventAny::SessionInit(SessionInitEvent {
@@ -334,22 +362,23 @@ mod tests {
         );
 
         assert!(
-            convert_event_to_message(AgentEventAny::ToolCall(ToolCallEvent {
+            convert_event_to_message(AgentEventAny::SkillLoad(SkillLoadEvent {
                 session_id: "s1".into(),
                 turn_id: "t1".into(),
-                name: "tool".into(),
-                input: Value::Null,
+                skill_name: "skill".into(),
                 timestamp: Utc::now(),
             }))
             .is_none()
         );
 
         assert!(
-            convert_event_to_message(AgentEventAny::SkillLoad(SkillLoadEvent {
+            convert_event_to_message(AgentEventAny::ToolCall(ToolCallEvent {
                 session_id: "s1".into(),
                 turn_id: "t1".into(),
-                skill_name: "skill".into(),
+                name: "tool".into(),
+                input: json!({}),
                 timestamp: Utc::now(),
+                tool_call_id: "tc1".to_string(),
             }))
             .is_none()
         );

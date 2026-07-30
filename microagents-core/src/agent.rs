@@ -16,9 +16,9 @@ use llms_sdk::{
 use microagents_events::{
     AgentEventAny, AssistantMessagePart, AssistantResponseEvent, DeltaType, SessionInitEvent,
     SessionInitType, SessionStopEvent, SkillLoadEvent, StreamDeltaEvent, TaskEvent, TaskStatus,
-    TextPart as AssistantTextPart, ThinkingPart as AssistantThinkingPart, ToolCallEvent,
-    ToolCallPart as AssistantToolCallPart, ToolResultEvent, Usage, UserPromptSubmitEvent,
-    types::ToolResult,
+    TextPart as AssistantTextPart, ThinkingPart as AssistantThinkingPart, ToolCallAnyEvent,
+    ToolCallEvent, ToolCallPart as AssistantToolCallPart, ToolResultEvent, Usage,
+    UserPromptSubmitEvent, types::ToolResult,
 };
 use microagents_storage::{
     jsonl::JsonlAgentStorage,
@@ -453,7 +453,7 @@ You are {} provided by {}
                 MicroAgentBuilderError::EnvVarNotFoundError("OPENAI_API_KEY".into())
             })?,
             SupportedProvider::Anthropic => check_env_var("ANTHROPIC_API_KEY").map_err(|_| {
-                MicroAgentBuilderError::EnvVarNotFoundError("OPENAI_API_KEY".into())
+                MicroAgentBuilderError::EnvVarNotFoundError("ANTHROPIC_API_KEY".into())
             })?,
         };
         Ok(MicroAgent {
@@ -841,12 +841,17 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                     }
                 }
 
+                let Some(final_message) = assistant_message.clone() else {
+                    yield Err(AgentError::RunError("LLM stream did not produce a full message".to_string()));
+                    return;
+                };
+
                 if tool_calls.is_empty() {
                     usage.latency = (Utc::now() - start_processing).num_milliseconds();
                     let ev = AgentEventAny::AssistantResponse(AssistantResponseEvent {
                         session_id: resolved_sid.clone(),
                         turn_id: turn_id.clone(),
-                        content: assistant_message.clone().expect("Message should have been set by now").content.iter().map(|c| match c {
+                        content: final_message.content.iter().map(|c| match c {
                             MessagePart::Text(t) => AssistantMessagePart::Text(AssistantTextPart { text: t.text.clone() }),
                             MessagePart::Thinking(t) => AssistantMessagePart::Thinking(AssistantThinkingPart { thinking: t.thinking.clone(), signature: t.signature.clone()}),
                             MessagePart::ToolCall(t) => AssistantMessagePart::ToolCall(AssistantToolCallPart {
@@ -861,7 +866,7 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                     let stop_ev = AgentEventAny::SessionStop(SessionStopEvent {
                         session_id: resolved_sid.clone(),
                         success: true,
-                        result: Some(assistant_message.expect("Message should have been set by now").content.iter().map(|c| match c {
+                        result: Some(final_message.content.iter().map(|c| match c {
                             MessagePart::Text(t) => AssistantMessagePart::Text(AssistantTextPart { text: t.text.clone() }),
                             MessagePart::Thinking(t) => AssistantMessagePart::Thinking(AssistantThinkingPart { thinking: t.thinking.clone(), signature: t.signature.clone()}),
                             MessagePart::ToolCall(t) => AssistantMessagePart::ToolCall(AssistantToolCallPart {
@@ -915,6 +920,21 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                             let tool = local_tools.get(&tc.name);
                             if let Some(t) = tool {
                                 let tool_name = tc.name.clone();
+                                let tc_any_ev = AgentEventAny::ToolAnyCall(ToolCallAnyEvent {
+                                    session_id: resolved_sid.clone(),
+                                    turn_id: turn_id.clone(),
+                                    name: tool_name.clone(),
+                                    input: v.clone(),
+                                    timestamp: Utc::now(),
+                                    tool_call_id: tc.id.clone(),
+                                });
+                                match self.storage.update_session(tc_any_ev.clone()).await {
+                                    Ok(_) => {},
+                                    Err(e) => {
+                                        yield Err(AgentError::RunError(format!("An error occurred while updating the session in the storage: {}", e)));
+                                        return;
+                                    }
+                                }
                                 let tc_ev = if tool_name != SKILLS_TOOL_NAME && tool_name != TASKS_TOOL_NAME {
                                     AgentEventAny::ToolCall(ToolCallEvent {
                                         session_id: resolved_sid.clone(),
@@ -922,6 +942,7 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                                         name: tool_name,
                                         input: v.clone(),
                                         timestamp: Utc::now(),
+                                        tool_call_id: tc.id.clone(),
                                     })
                                 } else if tool_name == SKILLS_TOOL_NAME {
                                     match v["skill_name"].as_str() {
@@ -1035,7 +1056,7 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                     }
                 }
 
-                self.history.push(assistant_message.clone().expect("Message should be set by now"));
+                self.history.push(final_message);
                 self.history.extend(tool_messages);
             }
         });
