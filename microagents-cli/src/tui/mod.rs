@@ -470,6 +470,8 @@ impl App {
                 name: t.task_name,
                 status: t.task_status,
             }),
+            // no-op, these are already handled by other branches
+            AgentEventAny::ToolAnyCall(_) => {}
             _ => unreachable!("AgentEventAny should not reach this branch"),
         }
     }

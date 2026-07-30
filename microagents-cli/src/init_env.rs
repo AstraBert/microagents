@@ -39,7 +39,7 @@ pub const SUPPORTED_LIT_EXTENSIONS: &[&str] = &[
 ];
 pub const SUPPORT_ENV_VARIABLES: &[(&str, &str, &str)] = &[
     ("OPENAI_API_KEY", "", "openai"),
-    ("ANTHROPIC_API_KEY", "", "openai"),
+    ("ANTHROPIC_API_KEY", "", "anthropic"),
 ];
 static EDGE_CONFIG: OnceLock<EdgeConfig> = OnceLock::new();
 pub static PARSER_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();

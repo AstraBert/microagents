@@ -33,7 +33,8 @@ struct Args {
     skill: Vec<String>,
 
     /// Provider to use for the agent, either 'openai' or 'anthropic'.
-    /// Falls back to 'openai' if not provided.
+    /// If the provider is omitted, tries to load it from the environment and,
+    /// if not found in the environment, falls back to 'openai'.
     #[arg(long, default_value = None)]
     provider: Option<String>,
 
