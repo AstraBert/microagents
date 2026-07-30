@@ -1,22 +1,24 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    env::{self},
+    collections::HashMap,
     fmt::{self, Debug},
     fs, io,
     str::FromStr,
     sync::Arc,
-    time::Duration,
 };
-
-use dashmap::DashMap;
 
 use async_stream::stream;
 use chrono::Utc;
 use futures_util::StreamExt;
+use llms_sdk::{
+    ApiType, LLM, LLMRequest, LLMStreamingResponse, Message, MessagePart, MessageRole, TextPart,
+    Tool, ToolCallPart, ToolResultPart,
+};
 use microagents_events::{
-    AgentEventAny, AssistantResponseEvent, DeltaType, SessionInitEvent, SessionInitType,
-    SessionStopEvent, SkillLoadEvent, StreamDeltaEvent, TaskEvent, TaskStatus, ToolCallEvent,
-    ToolResultEvent, Usage, UserPromptSubmitEvent, types::ToolResult,
+    AgentEventAny, AssistantMessagePart, AssistantResponseEvent, DeltaType, SessionInitEvent,
+    SessionInitType, SessionStopEvent, SkillLoadEvent, StreamDeltaEvent, TaskEvent, TaskStatus,
+    TextPart as AssistantTextPart, ThinkingPart as AssistantThinkingPart, ToolCallAnyEvent,
+    ToolCallEvent, ToolCallPart as AssistantToolCallPart, ToolResultEvent, Usage,
+    UserPromptSubmitEvent, types::ToolResult,
 };
 use microagents_storage::{
     jsonl::JsonlAgentStorage,
@@ -30,16 +32,10 @@ use tokio::{
     sync::{Mutex, Semaphore},
     task::JoinSet,
 };
-use ultrafast_models_sdk::{
-    ChatRequest, CircuitBreakerConfig, Message, ProviderConfig, Role, UltrafastClient,
-    cache::{CacheConfig, CacheType},
-    models::{Delta, FunctionCall, Tool, ToolCall},
-};
 
 use crate::{
     common::{
-        JsonResult, call_tool, check_env_var, convert_event_to_message, estimate_tokens,
-        get_incomplete_tasks, load_agents_md, parse_json_fragment,
+        call_tool, check_env_var, convert_event_to_message, get_incomplete_tasks, load_agents_md,
     },
     skills::{self, ensure_skill, find_skills, parse_skill},
     types::{Agent, AgentError, GenerationStream, RunStream, ToolExecutionContext, ToolFunction},
@@ -94,14 +90,19 @@ const MAX_CONCURRENT_TOOL_CALLS: usize = 10;
 
 /// Supported LLM providers.
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Default)]
-#[non_exhaustive]
 pub enum SupportedProvider {
     #[default]
     OpenAI,
-    OpenRouter,
-    Ollama,
-    Groq,
-    OpenAICompatible,
+    Anthropic,
+}
+
+impl From<SupportedProvider> for ApiType {
+    fn from(val: SupportedProvider) -> Self {
+        match val {
+            SupportedProvider::OpenAI => ApiType::OpenAI,
+            SupportedProvider::Anthropic => ApiType::Anthropic,
+        }
+    }
 }
 
 pub trait AsProvider {
@@ -119,10 +120,7 @@ impl FromStr for SupportedProvider {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "openai" => Ok(Self::OpenAI),
-            "openrouter" => Ok(Self::OpenRouter),
-            "ollama" => Ok(Self::Ollama),
-            "groq" => Ok(Self::Groq),
-            "openai-compatible" => Ok(Self::OpenAICompatible),
+            "anthropic" => Ok(Self::Anthropic),
             _ => Err(MicroAgentBuilderError::ProviderNotSupported(s.into())),
         }
     }
@@ -137,11 +135,8 @@ impl AsProvider for String {
 impl fmt::Display for SupportedProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
-            Self::OpenRouter => "openrouter",
-            Self::Groq => "groq",
-            Self::Ollama => "ollama",
             Self::OpenAI => "openai",
-            Self::OpenAICompatible => "openai-compatible",
+            Self::Anthropic => "anthropic",
         };
         write!(f, "{}", s)
     }
@@ -152,21 +147,10 @@ impl SupportedProvider {
     pub fn default_model(&self) -> Result<&'static str, MicroAgentBuilderError> {
         match self {
             // GPT-5.5 is the current default ChatGPT model as of May 2026
-            SupportedProvider::OpenAI => Ok("gpt-5.5"),
-
-            // llama3.2 is the most widely tested, hardware-friendly default
-            SupportedProvider::Ollama => Ok("llama3.2"),
-
-            // openai/gpt-oss-120b is Groq's documented default recommendation compatible with prompt caching
-            SupportedProvider::Groq => Ok("openai/gpt-oss-120b"),
+            SupportedProvider::OpenAI => Ok("gpt-5.6-terra"),
 
             // Claude Opus 4.7 by Anthropic is cuttig-edge in the models market
-            SupportedProvider::OpenRouter => Ok("anthropic/claude-opus-4.7"),
-
-            // The rest should specify a model
-            SupportedProvider::OpenAICompatible => Err(
-                MicroAgentBuilderError::ModelNotSpecifiedError("openai-compatible".into()),
-            ),
+            SupportedProvider::Anthropic => Ok("claude-sonnet-5"),
         }
     }
 }
@@ -192,15 +176,6 @@ pub enum MicroAgentBuilderError {
     AgentsMdResolutionError(#[from] io::Error),
 }
 
-/// Newtype wrapper so that [`UltrafastClient`] can implement [`Debug`].
-pub struct DebuggableClient(pub Arc<UltrafastClient>);
-
-impl Debug for DebuggableClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "UltrafastClient")
-    }
-}
-
 /// A fully-configured agent ready to generate responses or run conversations.
 ///
 /// Created via [`MicroAgentBuilder`]. Holds the conversation history, tool
@@ -210,28 +185,29 @@ pub struct MicroAgent<Ctx> {
     pub tools: HashMap<String, Arc<dyn ToolFunction<Ctx>>>,
     pub skills: HashMap<String, String>,
     pub provider: SupportedProvider,
+    pub base_url: Option<String>,
     pub model: String,
     pub system: String,
-    client: Option<DebuggableClient>,
-    /// Per-session clients for OpenRouter so that `x-session-id` is never reused across sessions.
-    pub openrouter_clients: DashMap<String, Arc<DebuggableClient>>,
+    pub api_key: String,
+    client: Arc<LLM>,
     pub tool_context: Arc<ToolExecutionContext<Ctx>>,
     pub storage: Box<dyn AgentStorage>,
     pub parallel_tool_calls: bool,
     pub tasks: Arc<Mutex<HashMap<String, TaskStatus>>>,
+    pub prompt_cache: bool,
 }
 
 impl<Ctx: Debug> Debug for MicroAgent<Ctx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MicroAgent")
             .field("history", &self.history)
+            .field("base_url", &self.base_url)
             .field("tools", &self.tools)
             .field("skills", &self.skills)
             .field("provider", &self.provider)
             .field("model", &self.model)
             .field("system", &self.system)
             .field("client", &self.client)
-            .field("openrouter_clients", &self.openrouter_clients.len())
             .field("tool_context", &self.tool_context)
             .field("storage", &self.storage)
             .field("parallel_tool_calls", &self.parallel_tool_calls)
@@ -260,6 +236,8 @@ pub struct MicroAgentBuilder<Ctx> {
     model: String,
     custom_instructions: String,
     tool_context: Arc<ToolExecutionContext<Ctx>>,
+    base_url: Option<String>,
+    prompt_cache: bool,
     pub storage: Box<dyn AgentStorage>,
     pub parallel_tool_calls: bool,
 }
@@ -287,6 +265,8 @@ impl<Ctx: Send + Sync + 'static> MicroAgentBuilder<Ctx> {
             tool_context: Arc::new(tool_context),
             storage: Box::new(InMemoryAgentStorage::default()) as Box<dyn AgentStorage>,
             parallel_tool_calls: false,
+            base_url: None,
+            prompt_cache: true,
         }
     }
 
@@ -316,11 +296,26 @@ impl<Ctx: Send + Sync + 'static> MicroAgentBuilder<Ctx> {
         Ok(self)
     }
 
-    /// Set the LLM provider (e.g. `"openai"`, `"groq"`, `"ollama"`).
+    /// Set the LLM provider (`"openai"` or `"anthropic"`).
     pub fn provider(mut self, provider: impl AsProvider) -> Result<Self, MicroAgentBuilderError> {
         let prov = provider.as_provider()?;
         self.provider = prov;
         Ok(self)
+    }
+
+    /// Set the base URL for the LLM provider. If unset, attempts to read from environment variables and,
+    /// if those are unset too, falls back to the default API url for the chosen provider
+    pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = Some(base_url.into());
+        self
+    }
+
+    /// Enable or disable prompt caching (for Anthropic, OpenAI always uses it).
+    ///
+    /// Enabled by default.
+    pub fn prompt_cache(mut self, prompt_cache: bool) -> Self {
+        self.prompt_cache = prompt_cache;
+        self
     }
 
     /// Set the model identifier. If empty, the provider's default is used.
@@ -429,6 +424,23 @@ You are {} provided by {}
         base
     }
 
+    fn resolve_base_url(&self) -> Option<String> {
+        if let Some(url) = self.base_url.clone() {
+            Some(url)
+        } else {
+            match self.provider {
+                SupportedProvider::OpenAI => match check_env_var("OPENAI_BASE_URL") {
+                    Ok(u) => Some(u),
+                    Err(_) => Some("https://api.openai.com/v1".to_string()),
+                },
+                SupportedProvider::Anthropic => match check_env_var("ANTHROPIC_BASE_URL") {
+                    Ok(u) => Some(u),
+                    Err(_) => Some("https://api.anthropic.com/v1".to_string()),
+                },
+            }
+        }
+    }
+
     /// Finalise the builder and return a [`MicroAgent`].
     ///
     /// Fails early if a required API key is missing for the chosen provider.
@@ -436,45 +448,29 @@ You are {} provided by {}
     pub fn build(self) -> Result<MicroAgent<Ctx>, MicroAgentBuilderError> {
         let model = self.resolve_model()?;
         let system = self.resolve_system(&model);
-        match self.provider {
-            SupportedProvider::Groq => {
-                check_env_var("GROQ_API_KEY").map_err(|_| {
-                    MicroAgentBuilderError::EnvVarNotFoundError("GROQ_API_KEY".into())
-                })?;
-            }
-            SupportedProvider::OpenAI => {
-                check_env_var("OPENAI_API_KEY").map_err(|_| {
-                    MicroAgentBuilderError::EnvVarNotFoundError("OPENAI_API_KEY".into())
-                })?;
-            }
-            SupportedProvider::OpenRouter => {
-                check_env_var("OPENROUTER_API_KEY").map_err(|_| {
-                    MicroAgentBuilderError::EnvVarNotFoundError("OPENROUTER_API_KEY".into())
-                })?;
-            }
-            SupportedProvider::OpenAICompatible => {
-                check_env_var("OPENAI_API_KEY").map_err(|_| {
-                    MicroAgentBuilderError::EnvVarNotFoundError("OPENAI_API_KEY".into())
-                })?;
-                check_env_var("OPENAI_BASE_URL").map_err(|_| {
-                    MicroAgentBuilderError::EnvVarNotFoundError("OPENAI_BASE_URL".into())
-                })?;
-            }
-            _ => {}
-        }
+        let api_key = match self.provider {
+            SupportedProvider::OpenAI => check_env_var("OPENAI_API_KEY").map_err(|_| {
+                MicroAgentBuilderError::EnvVarNotFoundError("OPENAI_API_KEY".into())
+            })?,
+            SupportedProvider::Anthropic => check_env_var("ANTHROPIC_API_KEY").map_err(|_| {
+                MicroAgentBuilderError::EnvVarNotFoundError("ANTHROPIC_API_KEY".into())
+            })?,
+        };
         Ok(MicroAgent {
             history: vec![],
+            base_url: self.resolve_base_url(),
             tools: self.tools,
             skills: self.skills,
             model,
+            api_key,
             provider: self.provider,
-            client: None,
-            openrouter_clients: DashMap::new(),
+            client: Arc::new(LLM::default()),
             system,
             tool_context: self.tool_context,
             storage: self.storage,
             parallel_tool_calls: self.parallel_tool_calls,
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            prompt_cache: self.prompt_cache,
         })
     }
 }
@@ -503,125 +499,6 @@ impl<Ctx> MicroAgent<Ctx> {
             }
         }
         Ok(prompt.to_owned())
-    }
-
-    /// Lazily initialise the LLM client.
-    ///
-    /// For non-OpenRouter providers the client is cached after the first call.
-    /// For OpenRouter a separate client is created (and cached) per
-    /// `sticky_session_id` so that the `x-session-id` header is never reused
-    /// across sessions.
-    pub fn init_client(
-        &mut self,
-        sticky_session_id: &str,
-    ) -> Result<Arc<UltrafastClient>, AgentError> {
-        if self.provider != SupportedProvider::OpenRouter
-            && let Some(c) = self.client.as_ref()
-        {
-            return Ok(c.0.clone());
-        }
-
-        if self.provider == SupportedProvider::OpenRouter
-            && let Some(entry) = self.openrouter_clients.get(sticky_session_id)
-        {
-            return Ok(entry.0.clone());
-        }
-
-        let mut base_client = UltrafastClient::standalone();
-        base_client = match self.provider {
-            SupportedProvider::OpenRouter => base_client.with_provider(
-                "openai",
-                ProviderConfig {
-                    name: "openai".into(),
-                    api_key: env::var("OPENROUTER_API_KEY")?,
-                    base_url: Some("https://openrouter.ai/api/v1".into()),
-                    timeout: Duration::from_secs(300),
-                    max_retries: 3,
-                    retry_delay: Duration::from_millis(500),
-                    rate_limit: None,
-                    model_mapping: HashMap::new(),
-                    headers: HashMap::from([(
-                        "x-session-id".to_string(),
-                        sticky_session_id.to_string(),
-                    )]),
-                    enabled: true,
-                    circuit_breaker: Some(CircuitBreakerConfig {
-                        failure_threshold: 5,
-                        recovery_timeout: Duration::from_secs(30),
-                        request_timeout: Duration::from_secs(10),
-                        half_open_max_calls: 3,
-                    }),
-                },
-            ),
-            SupportedProvider::OpenAI => base_client.with_openai(env::var("OPENAI_API_KEY")?),
-            SupportedProvider::Groq => base_client.with_groq(env::var("GROQ_API_KEY")?),
-            SupportedProvider::OpenAICompatible => base_client.with_provider(
-                "openai",
-                ProviderConfig {
-                    name: "openai".into(),
-                    api_key: env::var("OPENAI_API_KEY")?,
-                    base_url: Some(env::var("OPENAI_BASE_URL")?),
-                    timeout: Duration::from_secs(300),
-                    max_retries: 3,
-                    retry_delay: Duration::from_millis(500),
-                    rate_limit: None,
-                    model_mapping: HashMap::new(),
-                    headers: HashMap::new(),
-                    enabled: true,
-                    circuit_breaker: Some(CircuitBreakerConfig {
-                        failure_threshold: 5,
-                        recovery_timeout: Duration::from_secs(30),
-                        request_timeout: Duration::from_secs(10),
-                        half_open_max_calls: 3,
-                    }),
-                },
-            ),
-            SupportedProvider::Ollama => base_client.with_provider(
-                "openai",
-                ProviderConfig {
-                    base_url: Some(
-                        env::var("OLLAMA_BASE_URL").unwrap_or("http://localhost:11434/v1".into()),
-                    ),
-                    api_key: "ollama".into(),
-                    name: "openai".into(),
-                    timeout: Duration::from_secs(300),
-                    max_retries: 3,
-                    retry_delay: Duration::from_millis(500),
-                    rate_limit: None,
-                    model_mapping: HashMap::new(),
-                    headers: HashMap::new(),
-                    enabled: true,
-                    circuit_breaker: Some(CircuitBreakerConfig {
-                        failure_threshold: 5,
-                        recovery_timeout: Duration::from_secs(30),
-                        request_timeout: Duration::from_secs(10),
-                        half_open_max_calls: 3,
-                    }),
-                },
-            ),
-        };
-        let client = base_client
-            .with_routing_strategy(ultrafast_models_sdk::RoutingStrategy::Single)
-            .with_cache(CacheConfig {
-                enabled: true,
-                ttl: Duration::from_secs(600),
-                max_size: 1000,
-                cache_type: CacheType::InMemory,
-            })
-            .build()
-            .map_err(|e| AgentError::ClientInitFailed(e.to_string()))?;
-        let arcc = Arc::new(client);
-
-        if self.provider == SupportedProvider::OpenRouter {
-            self.openrouter_clients.insert(
-                sticky_session_id.to_string(),
-                Arc::new(DebuggableClient(arcc.clone())),
-            );
-        } else {
-            self.client = Some(DebuggableClient(arcc.clone()));
-        }
-
-        Ok(arcc)
     }
 }
 
@@ -736,24 +613,30 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
     /// The stream yields [`StreamChunk`]s that may contain text deltas or
     /// partial tool calls. Higher-level orchestration (e.g. [`run`]) is
     /// responsible for buffering and acting on tool calls.
-    async fn generate(&mut self, sticky_session_id: &str) -> Result<GenerationStream, AgentError> {
-        let client = self.init_client(sticky_session_id)?;
-        let tools: Vec<Tool> = self.tools.values().map(|t| t.to_sdk_tool()).collect();
-        let stream = client
-            .stream_chat_completion(ChatRequest {
-                model: self.model.clone(),
-                messages: self.history.clone(),
-                temperature: None,
-                stream: Some(true),
-                max_tokens: None,
-                tools: Some(tools),
-                tool_choice: Some(ultrafast_models_sdk::models::ToolChoice::Auto),
-                top_p: None,
-                frequency_penalty: None,
-                user: None,
-                presence_penalty: None,
-                stop: None,
-            })
+    async fn generate(&mut self) -> Result<GenerationStream, AgentError> {
+        let tools: Vec<Tool> = self
+            .tools
+            .values()
+            .map(|t| t.to_sdk_tool())
+            .collect::<Result<Vec<Tool>, AgentError>>()?;
+        let mut request = LLMRequest::builder()
+            .api_type(self.provider.clone().into())
+            .api_key(self.api_key.clone())
+            .model(self.model.clone())
+            .stream(true)
+            .messages(self.history.clone())
+            .parallel_tool_calls(self.parallel_tool_calls)
+            .build();
+        request.base_url = self.base_url.clone();
+        if !tools.is_empty() {
+            request.tools = Some(tools);
+        }
+        if self.prompt_cache && self.provider == SupportedProvider::Anthropic {
+            request.prompt_cache_ttl = Some("5m".to_string())
+        }
+        let stream = self
+            .client
+            .stream_response(request)
             .await
             .map_err(|e| AgentError::GenerationError(e.to_string()))?;
         let mapped =
@@ -773,8 +656,14 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
         session_id: Option<String>,
     ) -> Result<RunStream, AgentError> {
         let local_tools: HashMap<String, Arc<dyn ToolFunction<Ctx>>> = self.tools.clone();
-        let mut input_text = self.system.clone();
-        let mut completion_text = String::new();
+        let mut usage = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            latency: 0,
+        };
+        let mut assistant_message: Option<Message> = None;
         let prompt = self.resolve_prompt(&prompt)?;
         let start_processing = Utc::now();
         let s: RunStream = Box::pin(stream! {
@@ -843,15 +732,11 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                 vec![]
             };
             self.history = messages;
-            self.history.insert(0, Message { role: Role::System, content: self.system.clone(), name: None, tool_calls: None, tool_call_id: None });
+            self.history.insert(0, Message { role: MessageRole::System, content: vec![MessagePart::Text(TextPart::new(self.system.clone()))] });
             self.history.push(Message {
-                role: Role::User,
-                content: prompt.to_owned(),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
+                role: MessageRole::User,
+                content: vec![MessagePart::Text(TextPart::new(prompt.clone()))],
             });
-            input_text += &prompt;
             let turn_id = uuid::Uuid::new_v4().to_string();
             let user_prompt_submit = AgentEventAny::UserPromptSubmit(UserPromptSubmitEvent {
                 session_id: resolved_sid.clone(),
@@ -869,67 +754,73 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
             yield Ok(user_prompt_submit);
 
             loop {
-                let mut generation = match self.generate(&resolved_sid).await {
+                let mut generation = match self.generate().await {
                     Ok(g) => g,
                     Err(e) => {
                         yield Err(AgentError::RunError(format!("An error occurred while starting the generation stream: {}", e)));
                         return;
                     }
                 };
-                let mut text = String::new();
                 let mut tool_messages: Vec<Message> = vec![];
-                let mut tool_calls: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
+                let mut tool_calls: Vec<ToolCallPart> = vec![];
                 while let Some(g) = generation.next().await {
                     match g {
                         Ok(chunk) => {
-                            let mut deltas: Vec<(u32, Delta)> = vec![];
-                            for choice in chunk.choices {
-                                deltas.push((choice.index, choice.delta));
-                            }
-                            deltas.sort_by_key(|a| a.0);
-                            for (_, delta) in deltas {
-                                if let Some(c) = delta.content {
-                                    text += &c;
-                                    completion_text += &c;
-                                    let ev = AgentEventAny::StreamDelta(StreamDeltaEvent {
-                                        session_id: resolved_sid.clone(),
-                                        turn_id: turn_id.clone(),
-                                        delta: c,
-                                        delta_type: DeltaType::Text,
-                                        timestamp: Utc::now(),
-                                    });
-                                    match self.storage.update_session(ev.clone()).await {
-                                        Ok(_) => {},
-                                        Err(e) => {
-                                            yield Err(AgentError::RunError(format!("An error occurred while updating the session in the storage: {}", e)));
-                                            return;
+                            match chunk {
+                                LLMStreamingResponse::Delta(d) => {
+                                    if let Some(c) = d.delta {
+                                        let ev = AgentEventAny::StreamDelta(StreamDeltaEvent {
+                                            session_id: resolved_sid.clone(),
+                                            turn_id: turn_id.clone(),
+                                            delta: c,
+                                            delta_type: DeltaType::Text,
+                                            timestamp: Utc::now(),
+                                        });
+                                        match self.storage.update_session(ev.clone()).await {
+                                            Ok(_) => {},
+                                            Err(e) => {
+                                                yield Err(AgentError::RunError(format!("An error occurred while updating the session in the storage: {}", e)));
+                                                return;
+                                            }
                                         }
+                                        yield Ok(ev);
                                     }
-                                    yield Ok(ev);
                                 }
-                                if let Some(tcs) = delta.tool_calls {
-                                    for tc in tcs {
-                                        if let Some(func) = tc.function {
-                                            if let Some(tid) = tc.id && let Some(name) = func.name {
-                                                // First chunk with id and name: initialize entry
-                                                tool_calls.entry(tc.index).or_insert((tid, name, String::new()));
-                                            }
-                                            // Accumulate arguments regardless
-                                            if let Some(args) = func.arguments {
-                                                tool_calls.entry(tc.index).and_modify(|v| v.2 += &args);
-                                                completion_text += &args;
+                                LLMStreamingResponse::ToolDelta(_) => {}
+                                LLMStreamingResponse::ThinkingDelta(d) => {
+                                    if let Some(c) = d.delta {
+                                        let ev = AgentEventAny::StreamDelta(StreamDeltaEvent {
+                                            session_id: resolved_sid.clone(),
+                                            turn_id: turn_id.clone(),
+                                            delta: c,
+                                            delta_type: DeltaType::Thinking,
+                                            timestamp: Utc::now(),
+                                        });
+                                        match self.storage.update_session(ev.clone()).await {
+                                            Ok(_) => {},
+                                            Err(e) => {
+                                                yield Err(AgentError::RunError(format!("An error occurred while updating the session in the storage: {}", e)));
+                                                return;
                                             }
                                         }
+                                        yield Ok(ev);
                                     }
+                                }
+                                LLMStreamingResponse::Complete(c) => {
+                                    if let Some(u) = c.usage {
+                                        usage.input_tokens += u.input_tokens;
+                                        usage.output_tokens += u.output_tokens;
+                                        usage.cache_read_tokens += u.cache_read_tokens.unwrap_or_default();
+                                        usage.cache_write_tokens += u.cache_write_tokens.unwrap_or_default();
+                                    }
+                                    assistant_message = Some(c.message);
+                                    tool_calls = c.tool_calls.unwrap_or(vec![]);
                                 }
                             }
                         },
                         Err(e) => {
-                            let latency = (Utc::now() - start_processing).num_milliseconds();
-                            let stop_ev = AgentEventAny::SessionStop(SessionStopEvent { session_id: resolved_sid.clone(), success: false, result: None, error: Some(e.to_string()), timestamp: Utc::now(), usage: Usage {
-                                latency,
-                                ..Default::default()
-                            }, incomplete_tasks: {
+                            usage.latency = (Utc::now() - start_processing).num_milliseconds();
+                            let stop_ev = AgentEventAny::SessionStop(SessionStopEvent { session_id: resolved_sid.clone(), success: false, result: None, error: Some(e.to_string()), timestamp: Utc::now(), usage, incomplete_tasks: {
                                 let ts = self.tasks.lock().await;
                                 if ts.is_empty() {
                                     None
@@ -950,30 +841,44 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                     }
                 }
 
+                let Some(final_message) = assistant_message.clone() else {
+                    yield Err(AgentError::RunError("LLM stream did not produce a full message".to_string()));
+                    return;
+                };
+
                 if tool_calls.is_empty() {
-                    let latency = (Utc::now() - start_processing).num_milliseconds();
-                    let input_tokens = estimate_tokens(&input_text).unwrap_or_default();
-                    let output_tokens = estimate_tokens(&completion_text).unwrap_or_default();
+                    usage.latency = (Utc::now() - start_processing).num_milliseconds();
                     let ev = AgentEventAny::AssistantResponse(AssistantResponseEvent {
                         session_id: resolved_sid.clone(),
                         turn_id: turn_id.clone(),
-                        full_text: text.clone(),
-                        tool_calls: None,
+                        content: final_message.content.iter().map(|c| match c {
+                            MessagePart::Text(t) => AssistantMessagePart::Text(AssistantTextPart { text: t.text.clone() }),
+                            MessagePart::Thinking(t) => AssistantMessagePart::Thinking(AssistantThinkingPart { thinking: t.thinking.clone(), signature: t.signature.clone()}),
+                            MessagePart::ToolCall(t) => AssistantMessagePart::ToolCall(AssistantToolCallPart {
+                                id: t.id.clone(),
+                                name: t.name.clone(),
+                                arguments: t.arguments.clone(),
+                            }),
+                            _ => unreachable!("Should not reach this branch")
+                        }).collect(),
                         timestamp: Utc::now(),
                     });
                     let stop_ev = AgentEventAny::SessionStop(SessionStopEvent {
                         session_id: resolved_sid.clone(),
                         success: true,
-                        result: Some(text),
+                        result: Some(final_message.content.iter().map(|c| match c {
+                            MessagePart::Text(t) => AssistantMessagePart::Text(AssistantTextPart { text: t.text.clone() }),
+                            MessagePart::Thinking(t) => AssistantMessagePart::Thinking(AssistantThinkingPart { thinking: t.thinking.clone(), signature: t.signature.clone()}),
+                            MessagePart::ToolCall(t) => AssistantMessagePart::ToolCall(AssistantToolCallPart {
+                                id: t.id.clone(),
+                                name: t.name.clone(),
+                                arguments: t.arguments.clone(),
+                            }),
+                            _ => unreachable!("Should not reach this branch")
+                        }).collect()),
                         error: None,
                         timestamp: Utc::now(),
-                        usage: Usage {
-                            latency,
-                            output_chars: completion_text.len(),
-                            input_chars: input_text.len(),
-                            estimated_output_tokens: output_tokens,
-                            estimated_input_tokens: input_tokens,
-                        },
+                        usage,
                         incomplete_tasks: {
                             let ts = self.tasks.lock().await;
                             if ts.is_empty() {
@@ -1002,7 +907,6 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                     return;
                 }
 
-                let mut to_pop = HashSet::new();
                 let mut to_call = JoinSet::new();
                 let tool_ctx = self.tool_context.clone();
                 let concurrency = if !self.parallel_tool_calls {
@@ -1011,12 +915,26 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                     MAX_CONCURRENT_TOOL_CALLS
                 };
                 let semaphore = Arc::new(Semaphore::new(concurrency));
-                for (tid, name, args) in tool_calls.values() {
-                    match parse_json_fragment(args) {
-                        JsonResult::Valid(v) => {
-                            let tool = local_tools.get(name);
+                for tc in tool_calls {
+                            let v: Value = serde_json::from_str(&tc.arguments).expect("Arguments should be serializable");
+                            let tool = local_tools.get(&tc.name);
                             if let Some(t) = tool {
-                                let tool_name = name.clone();
+                                let tool_name = tc.name.clone();
+                                let tc_any_ev = AgentEventAny::ToolAnyCall(ToolCallAnyEvent {
+                                    session_id: resolved_sid.clone(),
+                                    turn_id: turn_id.clone(),
+                                    name: tool_name.clone(),
+                                    input: v.clone(),
+                                    timestamp: Utc::now(),
+                                    tool_call_id: tc.id.clone(),
+                                });
+                                match self.storage.update_session(tc_any_ev.clone()).await {
+                                    Ok(_) => {},
+                                    Err(e) => {
+                                        yield Err(AgentError::RunError(format!("An error occurred while updating the session in the storage: {}", e)));
+                                        return;
+                                    }
+                                }
                                 let tc_ev = if tool_name != SKILLS_TOOL_NAME && tool_name != TASKS_TOOL_NAME {
                                     AgentEventAny::ToolCall(ToolCallEvent {
                                         session_id: resolved_sid.clone(),
@@ -1024,6 +942,7 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                                         name: tool_name,
                                         input: v.clone(),
                                         timestamp: Utc::now(),
+                                        tool_call_id: tc.id.clone(),
                                     })
                                 } else if tool_name == SKILLS_TOOL_NAME {
                                     match v["skill_name"].as_str() {
@@ -1084,7 +1003,7 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                                     }
                                 };
                                 let t = t.clone();
-                                let tool_call_id = tid.clone();
+                                let tool_call_id = tc.id.clone();
                                 let ctx = tool_ctx.clone();
                                 to_call.spawn(async move {
                                     let _permit = permit;
@@ -1095,13 +1014,7 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                                     }
                                 });
                             }
-                        },
-                        JsonResult::Incomplete => {},
-                        JsonResult::Malformed => {
-                            to_pop.insert(tid.clone());
-                        }
                     }
-                }
                 while let Some(res) = to_call.join_next().await {
                     match res {
                         Ok(Ok((tid, tool_result))) => {
@@ -1129,8 +1042,10 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                                 },
                                 _ => unreachable!("ToolResult should not reach this branch")
                             };
-                            input_text += &content;
-                            tool_messages.push(Message { role: Role::Tool, content, name: None, tool_calls: None, tool_call_id: Some(tid) });
+                            tool_messages.push(Message { role: MessageRole::Tool, content: vec![MessagePart::ToolResult(ToolResultPart {
+                                tool_call_id: tid,
+                                result: content,
+                            })] });
                         }
                         Ok(Err(e)) => {
                             yield Err(AgentError::RunError(format!("Tool call failed: {}", e)));
@@ -1141,22 +1056,7 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                     }
                 }
 
-                self.history.push(Message {
-                    role: Role::Assistant,
-                    content: std::mem::take(&mut text),
-                    name: None,
-                    tool_calls: Some(tool_calls.iter().
-                        filter(|(_, (tid, _, _))| !to_pop.contains(tid))
-                        .map(|(_, (tid, name, args))| ToolCall {
-                        call_type: "function".into(),
-                        id: tid.clone(),
-                        function: FunctionCall {
-                            name: name.clone(),
-                            arguments: args.clone(),
-                        }
-                    }).collect()),
-                    tool_call_id: None,
-                });
+                self.history.push(final_message);
                 self.history.extend(tool_messages);
             }
         });
@@ -1172,6 +1072,7 @@ mod tests {
     };
     use async_stream::stream;
     use futures_util::StreamExt;
+    use llms_sdk::LLMStreamingDelta;
     use microagents_events::types::ToolResult;
     use serde_json::Value;
     use std::sync::Arc;
@@ -1201,19 +1102,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Agent for DummyAgent {
-        async fn generate(
-            &mut self,
-            _sticky_session_id: &str,
-        ) -> Result<GenerationStream, AgentError> {
+        async fn generate(&mut self) -> Result<GenerationStream, AgentError> {
             self.generate_called = true;
             let s = stream! {
-                yield Ok(ultrafast_models_sdk::models::StreamChunk {
-                    id: "1".into(),
-                    object: "chat.completion.chunk".into(),
-                    created: 0,
-                    model: "dummy".into(),
-                    choices: vec![],
-                });
+                yield Ok(LLMStreamingResponse::Delta(LLMStreamingDelta {
+                    stop: false,
+                    response_id: "1".to_string(),
+                    created_at: None,
+                    delta: Some("something".to_string())
+                }));
             };
             Ok(Box::pin(s))
         }
@@ -1306,14 +1203,6 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_builder_provider_sets_provider() {
-        let builder = MicroAgentBuilder::new(ToolExecutionContext::new(()))
-            .provider("groq".to_string())
-            .unwrap();
-        assert_eq!(builder.provider, SupportedProvider::Groq);
-    }
-
-    #[test]
     fn test_builder_provider_invalid_returns_error() {
         let result =
             MicroAgentBuilder::new(ToolExecutionContext::new(())).provider("unknown".to_string());
@@ -1328,11 +1217,19 @@ mod tests {
     }
 
     #[test]
+    fn test_builder_with_supported_provider_as_str() {
+        let builder = MicroAgentBuilder::new(ToolExecutionContext::new(()))
+            .provider("anthropic".to_string())
+            .unwrap();
+        assert_eq!(builder.provider, SupportedProvider::Anthropic);
+    }
+
+    #[test]
     fn test_builder_with_supported_provider_as_enum() {
         let builder = MicroAgentBuilder::new(ToolExecutionContext::new(()))
-            .provider(SupportedProvider::Ollama)
+            .provider(SupportedProvider::OpenAI)
             .unwrap();
-        assert_eq!(builder.provider, SupportedProvider::Ollama);
+        assert_eq!(builder.provider, SupportedProvider::OpenAI);
     }
 
     #[test]
@@ -1346,6 +1243,22 @@ mod tests {
         let builder =
             MicroAgentBuilder::new(ToolExecutionContext::new(())).parallel_tool_calls(true);
         assert!(builder.parallel_tool_calls);
+    }
+
+    #[test]
+    fn test_builder_prompt_cache_sets_flag() {
+        let builder = MicroAgentBuilder::new(ToolExecutionContext::new(())).prompt_cache(true);
+        assert!(builder.prompt_cache);
+    }
+
+    #[test]
+    fn test_builder_base_url_gets_set() {
+        let builder = MicroAgentBuilder::new(ToolExecutionContext::new(()))
+            .base_url("https://api.anthropic.com/v1");
+        assert_eq!(
+            builder.base_url,
+            Some("https://api.anthropic.com/v1".to_string())
+        );
     }
 
     #[test]
@@ -1398,72 +1311,118 @@ mod tests {
 
     #[test]
     fn test_build_sets_empty_history() {
+        let original_value = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "test");
+        }
         let agent = MicroAgentBuilder::new(ToolExecutionContext::new(()))
-            .provider("ollama".to_string())
+            .provider("openai".to_string())
             .unwrap()
             .build()
             .expect("Should be able to build the agent");
         assert!(agent.history.is_empty());
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", original_value);
+        }
     }
 
     #[test]
     fn test_build_sets_tools_on_agent() {
+        let original_value = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "test");
+        }
         let agent = MicroAgentBuilder::new(ToolExecutionContext::new(()))
-            .provider("ollama".to_string())
+            .provider("openai".to_string())
             .unwrap()
             .add_tool(Arc::new(DummyTool))
             .unwrap()
             .build()
             .expect("Should be able to build the agent");
         assert_eq!(agent.tools.len(), 3);
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", original_value);
+        }
     }
 
     #[test]
     fn test_build_sets_provider_on_agent() {
+        let original_value = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "test");
+        }
         let agent = MicroAgentBuilder::new(ToolExecutionContext::new(()))
-            .provider("ollama".to_string())
+            .provider("openai".to_string())
             .unwrap()
             .build()
             .expect("Should be able to build the agent");
-        assert_eq!(agent.provider, SupportedProvider::Ollama);
+        assert_eq!(agent.provider, SupportedProvider::OpenAI);
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", original_value);
+        }
     }
 
     #[test]
     fn test_build_sets_model_on_agent() {
+        let original_value = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "test");
+        }
         let agent = MicroAgentBuilder::new(ToolExecutionContext::new(()))
-            .provider("ollama".to_string())
+            .provider("openai".to_string())
             .unwrap()
-            .model("llama3.2")
+            .model("gpt-4.1")
             .build()
             .expect("Should be able to build the agent");
-        assert_eq!(agent.model, "llama3.2");
+        assert_eq!(agent.model, "gpt-4.1");
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", original_value);
+        }
     }
 
     #[test]
     fn test_build_sets_parallel_tool_calls_on_agent() {
+        let original_value = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "test");
+        }
         let agent = MicroAgentBuilder::new(ToolExecutionContext::new(()))
-            .provider("ollama".to_string())
+            .provider("openai".to_string())
             .unwrap()
             .parallel_tool_calls(true)
             .build()
             .expect("Should be able to build the agent");
         assert!(agent.parallel_tool_calls);
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", original_value);
+        }
     }
 
     #[test]
     fn test_build_system_prompt_contains_base() {
+        let original_value = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "test");
+        }
         let agent = MicroAgentBuilder::new(ToolExecutionContext::new(()))
-            .provider("ollama".to_string())
+            .provider("openai".to_string())
             .unwrap()
             .build()
             .expect("Should be able to build the agent");
         assert!(agent.system.contains("You are MicroAgent"));
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", original_value);
+        }
     }
 
     #[test]
     fn test_build_system_prompt_contains_tools() {
+        let original_value = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "test");
+        }
         let agent = MicroAgentBuilder::new(ToolExecutionContext::new(()))
-            .provider("ollama".to_string())
+            .provider("openai".to_string())
             .unwrap()
             .add_tool(Arc::new(DummyTool))
             .unwrap()
@@ -1471,6 +1430,9 @@ mod tests {
             .expect("Should be able to build the agent");
         assert!(agent.system.contains("<tools>"));
         assert!(agent.system.contains("<name>dummy</name>"));
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", original_value);
+        }
     }
 
     #[test]
@@ -1482,8 +1444,8 @@ mod tests {
         let agent = MicroAgentBuilder::new(ToolExecutionContext::new(()))
             .build()
             .expect("Should be able to build the agent");
-        // Default provider is OpenAI -> default model is gpt-5.5
-        assert!(agent.system.contains("gpt-5.5"));
+        // Default provider is OpenAI -> default model is gpt-5.6-terra
+        assert!(agent.system.contains("gpt-5.6-terra"));
         unsafe {
             std::env::set_var("OPENAI_API_KEY", original_value);
         }
@@ -1491,20 +1453,27 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_contains_custom_model_when_set() {
+        let original_value = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "test");
+        }
         let agent = MicroAgentBuilder::new(ToolExecutionContext::new(()))
-            .provider("ollama".to_string())
+            .provider("openai".to_string())
             .unwrap()
             .model("custom-model")
             .build()
             .expect("Should be able to build the agent");
         assert!(agent.system.contains("custom-model"));
-        assert!(!agent.system.contains("llama-3.2"));
+        assert!(!agent.system.contains("gpt-5.6-terra"));
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", original_value);
+        }
     }
 
     #[test]
     fn test_agent_fails_to_build_if_not_api_key() {
         let result = MicroAgentBuilder::new(ToolExecutionContext::new(()))
-            .provider("groq".to_string())
+            .provider("anthropic".to_string())
             .unwrap()
             .build();
         assert!(result.is_err_and(|e| matches!(e, MicroAgentBuilderError::EnvVarNotFoundError(_))));
@@ -1521,20 +1490,8 @@ mod tests {
             SupportedProvider::OpenAI
         );
         assert_eq!(
-            SupportedProvider::from_str("openrouter").unwrap(),
-            SupportedProvider::OpenRouter
-        );
-        assert_eq!(
-            SupportedProvider::from_str("ollama").unwrap(),
-            SupportedProvider::Ollama
-        );
-        assert_eq!(
-            SupportedProvider::from_str("groq").unwrap(),
-            SupportedProvider::Groq
-        );
-        assert_eq!(
-            SupportedProvider::from_str("openai-compatible").unwrap(),
-            SupportedProvider::OpenAICompatible
+            SupportedProvider::from_str("anthropic").unwrap(),
+            SupportedProvider::Anthropic
         );
     }
 
@@ -1546,38 +1503,19 @@ mod tests {
     #[test]
     fn test_supported_provider_display() {
         assert_eq!(SupportedProvider::OpenAI.to_string(), "openai");
-        assert_eq!(SupportedProvider::OpenRouter.to_string(), "openrouter");
-        assert_eq!(SupportedProvider::Ollama.to_string(), "ollama");
-        assert_eq!(SupportedProvider::Groq.to_string(), "groq");
-        assert_eq!(
-            SupportedProvider::OpenAICompatible.to_string(),
-            "openai-compatible"
-        );
+        assert_eq!(SupportedProvider::Anthropic.to_string(), "anthropic");
     }
 
     #[test]
     fn test_supported_provider_default_model() {
         assert_eq!(
             SupportedProvider::OpenAI.default_model().unwrap(),
-            "gpt-5.5"
+            "gpt-5.6-terra"
         );
         assert_eq!(
-            SupportedProvider::Ollama.default_model().unwrap(),
-            "llama3.2"
+            SupportedProvider::Anthropic.default_model().unwrap(),
+            "claude-sonnet-5"
         );
-        assert_eq!(
-            SupportedProvider::Groq.default_model().unwrap(),
-            "openai/gpt-oss-120b"
-        );
-        assert_eq!(
-            SupportedProvider::OpenRouter.default_model().unwrap(),
-            "anthropic/claude-opus-4.7"
-        );
-        assert!(
-            SupportedProvider::OpenAICompatible
-                .default_model()
-                .is_err_and(|e| matches!(e, MicroAgentBuilderError::ModelNotSpecifiedError(_)))
-        )
     }
 
     #[test]
@@ -1594,14 +1532,14 @@ mod tests {
     async fn test_dummy_agent_generate_sets_flag() {
         let mut agent = DummyAgent::new();
         assert!(!agent.generate_called);
-        let _ = agent.generate("hello").await;
+        let _ = agent.generate().await;
         assert!(agent.generate_called);
     }
 
     #[tokio::test]
     async fn test_dummy_agent_generate_returns_stream() {
         let mut agent = DummyAgent::new();
-        let mut stream = agent.generate("hello").await.unwrap();
+        let mut stream = agent.generate().await.unwrap();
         let item = stream.next().await;
         assert!(item.is_some());
     }

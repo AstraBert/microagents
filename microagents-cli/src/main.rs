@@ -32,10 +32,18 @@ struct Args {
     #[arg(long)]
     skill: Vec<String>,
 
-    /// Provider to use for the agent.
-    /// Falls back to 'openrouter' if not provided.
+    /// Provider to use for the agent, either 'openai' or 'anthropic'.
+    /// If the provider is omitted, tries to load it from the environment and,
+    /// if not found in the environment, falls back to 'openai'.
     #[arg(long, default_value = None)]
     provider: Option<String>,
+
+    /// Base URL to use for the specified provider.
+    /// If not provided, tries to load it from the environment and,
+    /// if not found in the environment, falls back to the default
+    /// provider URL.
+    #[arg(long, default_value = None)]
+    base_url: Option<String>,
 
     /// Storage backend for sessions peristence. Allowed values: 'jsonl', 'sqlite'.
     /// Defaults to 'jsonl' (store session events as newline-separated JSON objects in a file)
@@ -53,6 +61,10 @@ struct Args {
     /// Prompt to run in headless mode.
     #[arg(long, short, default_value = None)]
     prompt: Option<String>,
+
+    /// Disable prompt caching (only applicable if Anthropic is the provider).
+    #[arg(long, default_value_t = false)]
+    no_prompt_cache: bool,
 
     /// Whether to print some debug/info messages when initializing the environment.
     /// This option has an effect in headless mode only.
@@ -86,6 +98,8 @@ async fn build_storage(
 async fn build_agent(
     provider: Option<String>,
     model: Option<String>,
+    base_url: Option<String>,
+    prompt_cache: bool,
     storage: Option<String>,
     skills: Vec<String>,
 ) -> Result<microagents_core::agent::MicroAgent<()>, AgentError> {
@@ -103,6 +117,7 @@ async fn build_agent(
         .provider(prov)?
         .storage(st)
         .await?
+        .prompt_cache(prompt_cache)
         .load_agents_md()?
         .add_tool(Arc::new(tools::WriteTool))?
         .add_tool(Arc::new(tools::EditTool))?
@@ -117,6 +132,11 @@ async fn build_agent(
             builder = builder.add_skill(skill)?;
         }
         builder
+    };
+    let base_builder = if let Some(bu) = base_url {
+        base_builder.base_url(bu)
+    } else {
+        base_builder
     };
     Ok(base_builder.build()?)
 }
@@ -187,7 +207,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(p) = args.prompt {
         initialize_environment(args.verbose).await?;
-        let agent = build_agent(args.provider, args.model, args.storage, args.skill).await?;
+        let agent = build_agent(
+            args.provider,
+            args.model,
+            args.base_url,
+            !args.no_prompt_cache,
+            args.storage,
+            args.skill,
+        )
+        .await?;
         let mut stream = agent
             .run(p, resolved_session_id)
             .await
@@ -225,9 +253,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let model_c = args.model.clone();
             let skill_c = args.skill.clone();
             let storage_c = args.storage.clone();
+            let base_url_c = args.base_url.clone();
             async move {
                 // Building for TUI, verbose should always be true (as above)
-                let agent = build_agent(prov_c, model_c, storage_c, skill_c).await?;
+                let agent = build_agent(
+                    prov_c,
+                    model_c,
+                    base_url_c,
+                    !args.no_prompt_cache,
+                    storage_c,
+                    skill_c,
+                )
+                .await?;
                 agent.run(prompt, session_id).await
             }
         },

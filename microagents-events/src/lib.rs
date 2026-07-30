@@ -6,9 +6,9 @@ use serde_json::Value;
 
 use std::{convert::TryFrom, fmt};
 
-use crate::types::{AgentEvent, AgentEventError, JsonRpcNotification, ToolCall, ToolResult};
+use crate::types::{AgentEvent, AgentEventError, JsonRpcNotification, ToolResult};
 
-pub const EVENTS_PROTOCOL_VERSION: &str = "0.3.0";
+pub const EVENTS_PROTOCOL_VERSION: &str = "0.4.0";
 
 /// Indicates whether a session is being started fresh or resumed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,10 +84,10 @@ impl fmt::Display for TaskStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, Copy, Default)]
 pub struct Usage {
     pub latency: i64,
-    pub input_chars: usize,
-    pub estimated_input_tokens: usize,
-    pub output_chars: usize,
-    pub estimated_output_tokens: usize,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_write_tokens: u32,
+    pub cache_read_tokens: u32,
 }
 
 /// Event emitted when a session is initialized.
@@ -107,7 +107,7 @@ pub struct SessionInitEvent {
 pub struct SessionStopEvent {
     pub session_id: String,
     pub success: bool,
-    pub result: Option<String>,
+    pub result: Option<Vec<AssistantMessagePart>>,
     pub error: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub incomplete_tasks: Option<Vec<String>>,
@@ -139,6 +139,18 @@ pub struct ToolCallEvent {
     pub session_id: String,
     pub turn_id: String,
     pub name: String,
+    pub tool_call_id: String,
+    pub input: Value,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Event emitted when any tool (generic, skill or tasks) is called.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallAnyEvent {
+    pub session_id: String,
+    pub turn_id: String,
+    pub name: String,
+    pub tool_call_id: String,
     pub input: Value,
     pub timestamp: DateTime<Utc>,
 }
@@ -163,13 +175,38 @@ pub struct SkillLoadEvent {
     pub timestamp: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct TextPart {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ThinkingPart {
+    pub thinking: String,
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ToolCallPart {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(untagged)]
+pub enum AssistantMessagePart {
+    Text(TextPart),
+    Thinking(ThinkingPart),
+    ToolCall(ToolCallPart),
+}
+
 /// Event emitted when the assistant produces a complete response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantResponseEvent {
     pub session_id: String,
     pub turn_id: String,
-    pub full_text: String,
-    pub tool_calls: Option<Vec<ToolCall>>,
+    pub content: Vec<AssistantMessagePart>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -268,6 +305,16 @@ impl AgentEvent for ToolCallEvent {
     }
 }
 
+impl AgentEvent for ToolCallAnyEvent {
+    fn to_jsonrpc(&self) -> JsonRpcNotification {
+        serialize_to_jsonrpc("tool.any_call", self)
+    }
+
+    fn session_id(&self) -> String {
+        self.session_id.clone()
+    }
+}
+
 impl AgentEvent for ToolResultEvent {
     fn to_jsonrpc(&self) -> JsonRpcNotification {
         serialize_to_jsonrpc("tool.result", self)
@@ -333,6 +380,8 @@ pub enum AgentEventAny {
     Task(TaskEvent),
     #[serde(rename = "session.fork")]
     SessionFork(SessionForkEvent),
+    #[serde(rename = "tool.any_call")]
+    ToolAnyCall(ToolCallAnyEvent),
 }
 
 impl AgentEventAny {
@@ -345,6 +394,7 @@ impl AgentEventAny {
             Self::StreamDelta(s) => s.timestamp,
             Self::UserPromptSubmit(s) => s.timestamp,
             Self::ToolCall(s) => s.timestamp,
+            Self::ToolAnyCall(s) => s.timestamp,
             Self::ToolResult(s) => s.timestamp,
             Self::Task(s) => s.timestamp,
             Self::SessionFork(s) => s.timestamp,
@@ -360,6 +410,7 @@ impl AgentEventAny {
             Self::StreamDelta(s) => s.session_id = sid,
             Self::UserPromptSubmit(s) => s.session_id = sid,
             Self::ToolCall(s) => s.session_id = sid,
+            Self::ToolAnyCall(s) => s.session_id = sid,
             Self::ToolResult(s) => s.session_id = sid,
             Self::Task(s) => s.session_id = sid,
             Self::SessionFork(s) => s.session_id = sid,
@@ -375,6 +426,7 @@ impl AgentEvent for AgentEventAny {
             Self::SessionStop(e) => e.to_jsonrpc(),
             Self::StreamDelta(e) => e.to_jsonrpc(),
             Self::ToolCall(e) => e.to_jsonrpc(),
+            Self::ToolAnyCall(e) => e.to_jsonrpc(),
             Self::ToolResult(e) => e.to_jsonrpc(),
             Self::AssistantResponse(e) => e.to_jsonrpc(),
             Self::SkillLoad(e) => e.to_jsonrpc(),
@@ -392,6 +444,7 @@ impl AgentEvent for AgentEventAny {
             Self::StreamDelta(s) => s.session_id.clone(),
             Self::SkillLoad(s) => s.session_id.clone(),
             Self::ToolCall(s) => s.session_id.clone(),
+            Self::ToolAnyCall(s) => s.session_id.clone(),
             Self::ToolResult(s) => s.session_id.clone(),
             Self::UserPromptSubmit(s) => s.session_id.clone(),
             Self::Task(s) => s.session_id.clone(),
@@ -483,7 +536,9 @@ mod tests {
         let event = SessionStopEvent {
             session_id: "s1".into(),
             success: true,
-            result: Some("done".into()),
+            result: Some(vec![AssistantMessagePart::Text(TextPart {
+                text: "done".to_string(),
+            })]),
             error: None,
             timestamp: Utc::now(),
             usage: Usage::default(),
@@ -492,7 +547,10 @@ mod tests {
         let rpc = event.to_jsonrpc();
         assert_eq!(rpc.method, "session.stop");
         assert_eq!(rpc.params.get("success"), Some(&Value::from(true)));
-        assert_eq!(rpc.params.get("result"), Some(&Value::from("done")));
+        assert_eq!(
+            rpc.params.get("result"),
+            Some(&Value::from(vec![json!({"text": "done"})]))
+        );
         assert_eq!(rpc.params.get("error"), Some(&Value::Null));
         assert_eq!(rpc.params.get("incomplete_tasks"), Some(&Value::Null));
         assert_eq!(
@@ -540,11 +598,13 @@ mod tests {
             name: "read".into(),
             input: json!({"path": "/tmp"}),
             timestamp: Utc::now(),
+            tool_call_id: "tc1".to_string(),
         };
         let rpc = event.to_jsonrpc();
         assert_eq!(rpc.method, "tool.call");
         assert_eq!(rpc.params.get("name"), Some(&Value::from("read")));
         assert_eq!(rpc.params.get("input"), Some(&json!({"path": "/tmp"})));
+        assert_eq!(rpc.params.get("tool_call_id"), Some(&Value::from("tc1")));
     }
 
     #[test]
@@ -580,14 +640,29 @@ mod tests {
         let event = AssistantResponseEvent {
             session_id: "s1".into(),
             turn_id: "t1".into(),
-            full_text: "hi".into(),
-            tool_calls: None,
+            content: vec![AssistantMessagePart::Text(TextPart {
+                text: "hi".to_string(),
+            })],
             timestamp: Utc::now(),
         };
         let rpc = event.to_jsonrpc();
         assert_eq!(rpc.method, "assistant.response");
-        assert_eq!(rpc.params.get("full_text"), Some(&Value::from("hi")));
-        assert_eq!(rpc.params.get("tool_calls"), Some(&Value::Null));
+        let content = rpc.params.get("content");
+        match content {
+            None => panic!("`content` should be a key in the rpc message"),
+            Some(v) => match v.as_array() {
+                None => panic!("`content` should be an array"),
+                Some(values) => {
+                    let first = values.first().expect("Should have one element");
+                    match first.as_object() {
+                        None => panic!("Element of `content` should be an object"),
+                        Some(v) => {
+                            assert!(v.get("text").is_some_and(|g| g == &Value::from("hi")));
+                        }
+                    }
+                }
+            },
+        }
     }
 
     #[test]
@@ -689,7 +764,7 @@ mod tests {
             .method("session.stop".into())
             .add_param("session_id".into(), Value::from("s1"))
             .add_param("success".into(), Value::from(true))
-            .add_param("result".into(), Value::from("done"))
+            .add_param("result".into(), Value::from(vec![json!({"text": "done"})]))
             .add_param("error".into(), Value::Null)
             .add_param("incomplete_tasks".into(), Value::Null)
             .add_param("timestamp".into(), {
@@ -702,7 +777,7 @@ mod tests {
             });
         let any = AgentEventAny::try_from(rpc).unwrap();
         assert!(
-            matches!(any, AgentEventAny::SessionStop(ref e) if e.success && e.result == Some("done".into()) && e.error.is_none() && e.usage.latency == 0)
+            matches!(any, AgentEventAny::SessionStop(ref e) if e.success && e.result == Some(vec![AssistantMessagePart::Text(TextPart { text: "done".to_string() })]) && e.error.is_none() && e.usage.latency == 0)
         );
     }
 
@@ -768,6 +843,7 @@ mod tests {
             .add_param("turn_id".into(), Value::from("t1"))
             .add_param("name".into(), Value::from("read"))
             .add_param("input".into(), json!({"path": "/tmp"}))
+            .add_param("tool_call_id".into(), Value::from("tc1"))
             .add_param("timestamp".into(), {
                 let tms = Utc::now();
                 serde_json::to_value(tms).expect("Should convert to value")
@@ -815,14 +891,20 @@ mod tests {
             .method("assistant.response".into())
             .add_param("session_id".into(), Value::from("s1"))
             .add_param("turn_id".into(), Value::from("t1"))
-            .add_param("full_text".into(), Value::from("hi"))
+            .add_param(
+                "content".into(),
+                serde_json::to_value(vec![AssistantMessagePart::Text(TextPart {
+                    text: "hi".to_string(),
+                })])
+                .expect("Should convert to value"),
+            )
             .add_param("timestamp".into(), {
                 let tms = Utc::now();
                 serde_json::to_value(tms).expect("Should convert to value")
             });
         let any = AgentEventAny::try_from(rpc).unwrap();
         assert!(
-            matches!(any, AgentEventAny::AssistantResponse(ref e) if e.full_text == "hi" && e.tool_calls.is_none())
+            matches!(any, AgentEventAny::AssistantResponse(ref e) if e.content.len() == 1 && e.content.iter().all(|v| matches!(v, AssistantMessagePart::Text(_))))
         );
     }
 
@@ -832,14 +914,23 @@ mod tests {
             .method("assistant.response".into())
             .add_param("session_id".into(), Value::from("s1"))
             .add_param("turn_id".into(), Value::from("t1"))
-            .add_param("full_text".into(), Value::from("hi"))
-            .add_param("tool_calls".into(), json!([{"call_type":"function","id":"1","function":{"name":"tool","arguments":"{}"}}]))
+            .add_param(
+                "content".into(),
+                serde_json::to_value(vec![AssistantMessagePart::ToolCall(ToolCallPart {
+                    id: "tc1".to_string(),
+                    name: "tool".to_string(),
+                    arguments: "{}".to_string(),
+                })])
+                .expect("Should convert to value"),
+            )
             .add_param("timestamp".into(), {
                 let tms = Utc::now();
                 serde_json::to_value(tms).expect("Should convert to value")
             });
         let any = AgentEventAny::try_from(rpc).unwrap();
-        assert!(matches!(any, AgentEventAny::AssistantResponse(ref e) if e.tool_calls.is_some()));
+        assert!(
+            matches!(any, AgentEventAny::AssistantResponse(ref e) if e.content.len() == 1 && e.content.iter().all(|v| matches!(v, AssistantMessagePart::ToolCall(_))))
+        );
     }
 
     #[test]

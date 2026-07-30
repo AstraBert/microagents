@@ -21,19 +21,6 @@ pub enum AgentEventError {
     UnknownMethod(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCall {
-    pub id: String,
-    pub call_type: String,
-    pub function: FunctionCall,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionCall {
-    pub name: String,
-    pub arguments: String,
-}
-
 /// Result of a tool execution, either success with output or failure with an error message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -83,59 +70,9 @@ pub trait AgentEvent: Debug + Send + Sync {
 #[cfg(test)]
 mod tests {
 
-    use serde_json::{Error, json};
+    use serde_json::json;
 
     use super::*;
-
-    #[test]
-    fn test_value_from_toolcall() {
-        let tc = ToolCall {
-            call_type: "function".into(),
-            id: "1".into(),
-            function: FunctionCall {
-                name: "tool".into(),
-                arguments: "{}".into(),
-            },
-        };
-        let val = serde_json::to_value(&tc).expect("Should be able to convert to Value");
-        if let Some(v) = val.as_object() {
-            assert_eq!(v.get("call_type"), Some(Value::from("function")).as_ref());
-            assert_eq!(v.get("id"), Some(Value::from("1")).as_ref());
-            assert!(v.get("function").is_some_and(|o| o.is_object()));
-        }
-    }
-
-    #[test]
-    fn test_toolcall_from_value_ok() {
-        let value = json!({
-            "call_type": "function",
-            "id": "1",
-            "function": {
-                "name": "tool",
-                "arguments": "{}"
-            }
-        });
-        let tc: ToolCall = serde_json::from_value(value)
-            .expect("Value should be correctly converted to tool call");
-        assert_eq!(tc.call_type, "function".to_string());
-        assert_eq!(tc.id, "1".to_string());
-        assert_eq!(tc.function.name, "tool".to_string());
-        assert_eq!(tc.function.arguments, "{}".to_string());
-    }
-
-    #[test]
-    fn test_toolcall_from_value_err() {
-        let value = json!({
-            "call_typ": "function",
-            "id": "1",
-            "func": {
-                "name": "tool",
-                "arguments": "{}"
-            }
-        });
-        let result: Result<ToolCall, Error> = serde_json::from_value(value);
-        assert!(result.is_err());
-    }
 
     #[test]
     fn test_value_from_tool_result() {

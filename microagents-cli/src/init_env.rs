@@ -2,7 +2,6 @@ use ignore::WalkBuilder;
 use indicatif::ProgressIterator;
 use liteparse::{LiteParse, LiteParseConfig};
 use microagents_core::agent::SupportedProvider;
-use microagents_core::common::tokenizer;
 use microagents_core::types::AgentError;
 use qdrant_edge::{
     AnyVariants, Condition, Distance, EdgeConfig, EdgeShard, EdgeSparseVectorParams,
@@ -39,11 +38,8 @@ pub const SUPPORTED_LIT_EXTENSIONS: &[&str] = &[
     ".xlsx", ".xlsm", ".ods", ".csv", ".tsv",
 ];
 pub const SUPPORT_ENV_VARIABLES: &[(&str, &str, &str)] = &[
-    ("OPENROUTER_API_KEY", "", "openrouter"),
-    ("OPENAI_API_KEY", "OPENAI_BASE_URL", "openai-compatible"),
     ("OPENAI_API_KEY", "", "openai"),
-    ("GROQ_API_KEY", "", "groq"),
-    ("", "OLLAMA_BASE_URL", "ollama"),
+    ("ANTHROPIC_API_KEY", "", "anthropic"),
 ];
 static EDGE_CONFIG: OnceLock<EdgeConfig> = OnceLock::new();
 pub static PARSER_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -507,7 +503,9 @@ pub fn infer_provider_from_env() -> Result<SupportedProvider, AgentError> {
                 Ok(_) => {
                     if !api_key.is_empty() {
                         match std::env::var(api_key) {
-                            Ok(_) => return Ok(SupportedProvider::from_str(provider_name)?),
+                            Ok(_) => {
+                                return Ok(SupportedProvider::from_str(provider_name)?);
+                            }
                             Err(_) => continue,
                         }
                     } else {
@@ -537,10 +535,6 @@ pub async fn initialize_environment(
     }
 
     let _ = edge_config();
-    if verbose {
-        println!("Loading tokenizer for token estimation...");
-    }
-    let _ = tokenizer().as_ref()?;
 
     let files = collect_files()?;
     if verbose {

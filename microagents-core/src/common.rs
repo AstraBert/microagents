@@ -1,5 +1,3 @@
-#[cfg(feature = "token_estimation")]
-use std::sync::OnceLock;
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -7,12 +5,11 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use microagents_events::{AgentEventAny, TaskStatus, types::ToolResult};
-use serde_json::Value;
-use ultrafast_models_sdk::{
-    Message, Role,
-    models::{FunctionCall, ToolCall},
+use llms_sdk::{
+    Message, MessagePart, MessageRole, TextPart, ThinkingPart, ToolCallPart, ToolResultPart,
 };
+use microagents_events::{AgentEventAny, AssistantMessagePart, TaskStatus, types::ToolResult};
+use serde_json::Value;
 
 use crate::{
     agent::MicroAgentBuilderError,
@@ -21,20 +18,12 @@ use crate::{
 
 const AGENTS_MD: &str = "AGENTS.md";
 
-#[cfg(feature = "token_estimation")]
-pub static TOKENIZER: OnceLock<Result<tokie::Tokenizer, tokie::HubError>> = OnceLock::new();
-
-#[cfg(feature = "token_estimation")]
-pub fn tokenizer() -> &'static Result<tokie::Tokenizer, tokie::HubError> {
-    TOKENIZER.get_or_init(|| tokie::Tokenizer::from_pretrained("codellama/CodeLlama-7b-hf"))
-}
-
 /// Verify that an environment variable is set.
 ///
 /// Returns `Ok(())` if the variable exists, otherwise propagates the [`VarError`].
-pub fn check_env_var(api_key: &str) -> Result<(), std::env::VarError> {
-    let _ = std::env::var(api_key)?;
-    Ok(())
+pub fn check_env_var(api_key: &str) -> Result<String, std::env::VarError> {
+    let v = std::env::var(api_key)?;
+    Ok(v)
 }
 
 /// Convert a persisted [`AgentEventAny`] back into an SDK [`Message`].
@@ -44,42 +33,44 @@ pub fn check_env_var(api_key: &str) -> Result<(), std::env::VarError> {
 pub fn convert_event_to_message(event: AgentEventAny) -> Option<Message> {
     match event {
         AgentEventAny::UserPromptSubmit(p) => Some(Message {
-            role: Role::User,
-            content: p.prompt,
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
+            role: MessageRole::User,
+            content: vec![MessagePart::Text(TextPart::new(p.prompt))],
+        }),
+        AgentEventAny::ToolAnyCall(tc) => Some(Message {
+            role: MessageRole::Assistant,
+            content: vec![MessagePart::ToolCall(ToolCallPart {
+                id: tc.tool_call_id.clone(),
+                name: tc.name.clone(),
+                arguments: serde_json::to_string(&tc.input)
+                    .expect("Arguments should be serializable"),
+            })],
         }),
         AgentEventAny::AssistantResponse(p) => {
-            let msg = if let Some(tc) = p.tool_calls {
-                let calls: Vec<ToolCall> = tc
-                    .iter()
-                    .map(|t| ToolCall {
-                        call_type: t.call_type.clone(),
-                        id: t.id.clone(),
-                        function: FunctionCall {
-                            name: t.function.name.clone(),
-                            arguments: t.function.arguments.clone(),
-                        },
-                    })
-                    .collect();
-                Message {
-                    role: Role::Assistant,
-                    content: p.full_text,
-                    name: None,
-                    tool_calls: Some(calls),
-                    tool_call_id: None,
+            let mut content: Vec<MessagePart> = vec![];
+            for c in p.content {
+                match c {
+                    AssistantMessagePart::Text(t) => {
+                        content.push(MessagePart::Text(TextPart { text: t.text }))
+                    }
+                    AssistantMessagePart::Thinking(t) => {
+                        content.push(MessagePart::Thinking(ThinkingPart {
+                            thinking: t.thinking,
+                            signature: t.signature,
+                        }))
+                    }
+                    AssistantMessagePart::ToolCall(tc) => {
+                        content.push(MessagePart::ToolCall(ToolCallPart {
+                            id: tc.id,
+                            name: tc.name,
+                            arguments: tc.arguments,
+                        }));
+                    }
                 }
-            } else {
-                Message {
-                    role: Role::Assistant,
-                    content: p.full_text,
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                }
-            };
-            Some(msg)
+            }
+            Some(Message {
+                role: MessageRole::Assistant,
+                content,
+            })
         }
         AgentEventAny::ToolResult(p) => {
             let result = match p.result {
@@ -88,11 +79,11 @@ pub fn convert_event_to_message(event: AgentEventAny) -> Option<Message> {
                 _ => unreachable!("ToolResult should not reach this branch"),
             };
             Some(Message {
-                role: Role::Tool,
-                content: result,
-                name: None,
-                tool_calls: None,
-                tool_call_id: Some(p.tool_call_id),
+                role: MessageRole::Tool,
+                content: vec![MessagePart::ToolResult(ToolResultPart {
+                    tool_call_id: p.tool_call_id,
+                    result,
+                })],
             })
         }
         _ => None,
@@ -178,33 +169,6 @@ fn validate_incomplete_tasks(
     Ok(by_status.clone())
 }
 
-/// Result of attempting to parse a (potentially partial) JSON string.
-pub enum JsonResult {
-    /// Fully valid JSON value.
-    Valid(Value),
-    /// The input is a valid prefix but truncated (EOF while parsing).
-    Incomplete,
-    /// The input is not valid JSON.
-    Malformed,
-}
-
-/// Parse a JSON string that may be incomplete (e.g. streaming tool arguments).
-///
-/// Returns [`JsonResult::Incomplete`] when the payload is cut off mid-token,
-/// allowing the caller to buffer and retry.
-pub fn parse_json_fragment(s: &str) -> JsonResult {
-    let v = serde_json::from_str::<Value>(s);
-    match v {
-        Ok(val) => JsonResult::Valid(val),
-        Err(e) => {
-            if e.is_eof() {
-                return JsonResult::Incomplete;
-            }
-            JsonResult::Malformed
-        }
-    }
-}
-
 /// Validate tool arguments against its JSON schema and then execute it.
 ///
 /// This is the canonical entry-point for invoking a [`ToolFunction`] from the
@@ -219,22 +183,6 @@ pub async fn call_tool<Ctx: Send + Sync + 'static>(
         .map_err(|e| AgentError::ToolCallError(e.to_string()))?;
     let result = tool.execute(tool_args, &tool_context).await?;
     Ok(result)
-}
-
-/// Estimate the number of tokens in a given text using the GPT-2 tokenizer.
-/// Requires the `token_estimation` feature. Returns 0 if the feature is disabled.
-pub fn estimate_tokens(_text: &str) -> Result<usize, AgentError> {
-    #[cfg(feature = "token_estimation")]
-    {
-        Ok(tokenizer()
-            .as_ref()
-            .map_err(|e| AgentError::TokenizerLoadingError(e.to_string()))?
-            .count_tokens(_text))
-    }
-    #[cfg(not(feature = "token_estimation"))]
-    {
-        Ok(0)
-    }
 }
 
 /// Load the content of an AGENTS.md file in the current directory, if it exists
@@ -254,10 +202,11 @@ mod tests {
     use chrono::Utc;
     use microagents_events::{
         AssistantResponseEvent, SessionInitEvent, SessionInitType, SessionStopEvent,
-        SkillLoadEvent, StreamDeltaEvent, TaskEvent, TaskStatus, ToolCallEvent, ToolResultEvent,
+        SkillLoadEvent, StreamDeltaEvent, TaskEvent, TaskStatus, TextPart as AssistantTextPart,
+        ToolCallAnyEvent, ToolCallEvent, ToolCallPart as AssistantToolCallPart, ToolResultEvent,
         Usage, UserPromptSubmitEvent,
-        types::{FunctionCall as EventFunctionCall, ToolCall as EventToolCall},
     };
+    use serde_json::json;
 
     #[test]
     fn test_convert_user_prompt_submit() {
@@ -268,10 +217,8 @@ mod tests {
             timestamp: Utc::now(),
         });
         let msg = convert_event_to_message(event).unwrap();
-        assert_eq!(msg.role, Role::User);
-        assert_eq!(msg.content, "hello");
-        assert!(msg.tool_calls.is_none());
-        assert!(msg.tool_call_id.is_none());
+        assert_eq!(msg.role, MessageRole::User);
+        assert!(matches!(msg.content[0], MessagePart::Text(ref t) if t.text == "hello"));
     }
 
     #[test]
@@ -279,14 +226,14 @@ mod tests {
         let event = AgentEventAny::AssistantResponse(AssistantResponseEvent {
             session_id: "s1".into(),
             turn_id: "t1".into(),
-            full_text: "hi there".into(),
-            tool_calls: None,
+            content: vec![AssistantMessagePart::Text(AssistantTextPart {
+                text: "hi there".to_string(),
+            })],
             timestamp: Utc::now(),
         });
         let msg = convert_event_to_message(event).unwrap();
-        assert_eq!(msg.role, Role::Assistant);
-        assert_eq!(msg.content, "hi there");
-        assert!(msg.tool_calls.is_none());
+        assert_eq!(msg.role, MessageRole::Assistant);
+        assert!(matches!(msg.content[0], MessagePart::Text(ref t) if t.text == "hi there"));
     }
 
     #[test]
@@ -294,24 +241,32 @@ mod tests {
         let event = AgentEventAny::AssistantResponse(AssistantResponseEvent {
             session_id: "s1".into(),
             turn_id: "t1".into(),
-            full_text: "calling tool".into(),
-            tool_calls: Some(vec![EventToolCall {
-                id: "tc1".into(),
-                call_type: "function".into(),
-                function: EventFunctionCall {
-                    name: "my_tool".into(),
+            content: vec![
+                AssistantMessagePart::Text(AssistantTextPart {
+                    text: "calling tool".to_string(),
+                }),
+                AssistantMessagePart::ToolCall(AssistantToolCallPart {
+                    id: "tc1".to_string(),
+                    name: "my_tool".to_string(),
                     arguments: "{\"x\":1}".into(),
-                },
-            }]),
+                }),
+            ],
             timestamp: Utc::now(),
         });
         let msg = convert_event_to_message(event).unwrap();
-        assert_eq!(msg.role, Role::Assistant);
-        let calls = msg.tool_calls.unwrap();
+        assert_eq!(msg.role, MessageRole::Assistant);
+        let calls: Vec<MessagePart> = msg
+            .content
+            .iter()
+            .filter(|&t| matches!(t, MessagePart::ToolCall(_)))
+            .cloned()
+            .collect();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "tc1");
-        assert_eq!(calls[0].function.name, "my_tool");
-        assert_eq!(calls[0].function.arguments, "{\"x\":1}");
+        if let MessagePart::ToolCall(tc) = calls[0].clone() {
+            assert_eq!(tc.id, "tc1");
+            assert_eq!(tc.name, "my_tool");
+            assert_eq!(tc.arguments, "{\"x\":1}");
+        }
     }
 
     #[test]
@@ -324,9 +279,12 @@ mod tests {
             timestamp: Utc::now(),
         });
         let msg = convert_event_to_message(event).unwrap();
-        assert_eq!(msg.role, Role::Tool);
-        assert_eq!(msg.content, "Tool call succeeded: done");
-        assert_eq!(msg.tool_call_id, Some("tc1".into()));
+        assert_eq!(msg.role, MessageRole::Tool);
+        let first = msg.content.first().unwrap();
+        if let MessagePart::ToolResult(tr) = first {
+            assert_eq!(tr.result, "Tool call succeeded: done");
+            assert_eq!(tr.tool_call_id, "tc1");
+        }
     }
 
     #[test]
@@ -339,9 +297,30 @@ mod tests {
             timestamp: Utc::now(),
         });
         let msg = convert_event_to_message(event).unwrap();
-        assert_eq!(msg.role, Role::Tool);
-        assert_eq!(msg.content, "Tool call failed: oops");
-        assert_eq!(msg.tool_call_id, Some("tc2".into()));
+        assert_eq!(msg.role, MessageRole::Tool);
+        let first = msg.content.first().unwrap();
+        if let MessagePart::ToolResult(tr) = first {
+            assert_eq!(tr.result, "Tool call failed: oops");
+            assert_eq!(tr.tool_call_id, "tc2");
+        }
+    }
+
+    #[test]
+    fn test_convert_tool_call_to_message() {
+        let msg = convert_event_to_message(AgentEventAny::ToolAnyCall(ToolCallAnyEvent {
+            session_id: "s1".into(),
+            turn_id: "t1".into(),
+            name: "tool".into(),
+            input: json!({}),
+            timestamp: Utc::now(),
+            tool_call_id: "tc1".to_string(),
+        }))
+        .expect("Should convert to a non-null message");
+        assert_eq!(msg.role, MessageRole::Assistant);
+        let first = msg.content.first().unwrap();
+        assert!(
+            matches!(first, MessagePart::ToolCall(tc) if tc.name == "tool" && tc.id == "tc1" && tc.arguments == "{}")
+        )
     }
 
     #[test]
@@ -383,17 +362,6 @@ mod tests {
         );
 
         assert!(
-            convert_event_to_message(AgentEventAny::ToolCall(ToolCallEvent {
-                session_id: "s1".into(),
-                turn_id: "t1".into(),
-                name: "tool".into(),
-                input: Value::Null,
-                timestamp: Utc::now(),
-            }))
-            .is_none()
-        );
-
-        assert!(
             convert_event_to_message(AgentEventAny::SkillLoad(SkillLoadEvent {
                 session_id: "s1".into(),
                 turn_id: "t1".into(),
@@ -402,30 +370,18 @@ mod tests {
             }))
             .is_none()
         );
-    }
 
-    #[test]
-    fn test_parse_json_fragment_valid() {
-        match parse_json_fragment(r#"{"key": "value"}"#) {
-            JsonResult::Valid(v) => assert_eq!(v["key"], "value"),
-            _ => panic!("expected Valid"),
-        }
-    }
-
-    #[test]
-    fn test_parse_json_fragment_incomplete() {
-        match parse_json_fragment(r#"{"key": "val""#) {
-            JsonResult::Incomplete => {}
-            _ => panic!("expected Incomplete"),
-        }
-    }
-
-    #[test]
-    fn test_parse_json_fragment_malformed() {
-        match parse_json_fragment(r#"{"key": "value",}"#) {
-            JsonResult::Malformed => {}
-            _ => panic!("expected Malformed"),
-        }
+        assert!(
+            convert_event_to_message(AgentEventAny::ToolCall(ToolCallEvent {
+                session_id: "s1".into(),
+                turn_id: "t1".into(),
+                name: "tool".into(),
+                input: json!({}),
+                timestamp: Utc::now(),
+                tool_call_id: "tc1".to_string(),
+            }))
+            .is_none()
+        );
     }
 
     #[derive(Debug)]
@@ -486,20 +442,6 @@ mod tests {
             AgentError::ToolCallError(_) => {}
             other => panic!("expected ToolCallError, got {:?}", other),
         }
-    }
-
-    #[test]
-    #[cfg(feature = "token_estimation")]
-    fn test_estimate_tokens() {
-        let count = estimate_tokens("hello world").expect("Should be able to estimate tokens");
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    #[cfg(not(feature = "token_estimation"))]
-    fn test_estimate_tokens() {
-        let count = estimate_tokens("hello world").expect("Should be able to estimate tokens");
-        assert_eq!(count, 0);
     }
 
     #[test]

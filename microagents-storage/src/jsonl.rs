@@ -119,7 +119,8 @@ impl AgentStorage for JsonlAgentStorage {
 mod tests {
     use chrono::Utc;
     use microagents_events::{
-        AssistantResponseEvent, SessionStopEvent, Usage, UserPromptSubmitEvent,
+        AssistantMessagePart, AssistantResponseEvent, SessionStopEvent, TextPart, Usage,
+        UserPromptSubmitEvent,
     };
 
     use super::*;
@@ -190,8 +191,9 @@ mod tests {
             .update_session(AgentEventAny::AssistantResponse(AssistantResponseEvent {
                 session_id: "1".to_string(),
                 turn_id: "t1".to_string(),
-                full_text: "hello".to_string(),
-                tool_calls: None,
+                content: vec![AssistantMessagePart::Text(TextPart {
+                    text: "hello".to_string(),
+                })],
                 timestamp: Utc::now(),
             }))
             .await
@@ -199,7 +201,9 @@ mod tests {
         jsonl
             .update_session(AgentEventAny::SessionStop(SessionStopEvent {
                 session_id: "1".to_string(),
-                result: Some("hello".to_string()),
+                result: Some(vec![AssistantMessagePart::Text(TextPart {
+                    text: "hello".to_string(),
+                })]),
                 error: None,
                 success: true,
                 timestamp: Utc::now(),
