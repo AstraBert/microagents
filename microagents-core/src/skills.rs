@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 use std::{collections::HashMap, fs, io};
 use thiserror::Error;
@@ -86,13 +86,40 @@ pub fn parse_skill(skill_file: &Path) -> Result<String, SkillLoadingError> {
     Ok(frontmatter.description)
 }
 
-/// Locate a skill by name, preferring the local project directory.
+/// Locate a skill by name, preferring the default local project directory.
 ///
 /// Searches `.agents/skills/{name}` first, then `~/.agents/skills/{name}`.
 /// Returns `None` if the skill cannot be found in either location.
 pub fn ensure_skill(skill_name: &str) -> Option<PathBuf> {
-    let g = global_skills_path().join(skill_name);
-    let p = PathBuf::from(SKILLS_PATH).join(skill_name);
+    ensure_skill_with_project_path(Path::new(SKILLS_PATH), skill_name)
+}
+
+pub(crate) fn is_valid_skill_name(skill_name: &str) -> bool {
+    !skill_name.is_empty()
+        && !skill_name.contains(['/', '\\'])
+        && Path::new(skill_name)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+pub(crate) fn ensure_skill_with_project_path(
+    project_skills_path: &Path,
+    skill_name: &str,
+) -> Option<PathBuf> {
+    ensure_skill_with_paths(project_skills_path, global_skills_path(), skill_name)
+}
+
+fn ensure_skill_with_paths(
+    project_skills_path: &Path,
+    global_skills_path: &Path,
+    skill_name: &str,
+) -> Option<PathBuf> {
+    if !is_valid_skill_name(skill_name) {
+        return None;
+    }
+
+    let g = global_skills_path.join(skill_name);
+    let p = project_skills_path.join(skill_name);
     if p.exists() {
         return Some(p);
     } else if g.exists() {
@@ -101,15 +128,26 @@ pub fn ensure_skill(skill_name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Discover all available skills in both local and global directories.
+/// Discover all available skills in the default local and global directories.
 ///
 /// Duplicates are removed; local skills shadow global ones.
 pub fn find_skills() -> Result<HashMap<String, String>, SkillLoadingError> {
-    let g = global_skills_path();
-    let p = PathBuf::from(SKILLS_PATH);
+    find_skills_with_project_path(Path::new(SKILLS_PATH))
+}
+
+pub(crate) fn find_skills_with_project_path(
+    project_skills_path: &Path,
+) -> Result<HashMap<String, String>, SkillLoadingError> {
+    find_skills_with_paths(project_skills_path, global_skills_path())
+}
+
+fn find_skills_with_paths(
+    project_skills_path: &Path,
+    global_skills_path: &Path,
+) -> Result<HashMap<String, String>, SkillLoadingError> {
     let mut all_skills = HashMap::new();
-    if g.exists() {
-        let result = fs::read_dir(g)?;
+    if global_skills_path.exists() {
+        let result = fs::read_dir(global_skills_path)?;
         for entry in result {
             let entry = entry?;
             if entry.path().is_dir() {
@@ -119,8 +157,8 @@ pub fn find_skills() -> Result<HashMap<String, String>, SkillLoadingError> {
         }
     }
 
-    if p.exists() {
-        let result = fs::read_dir(p)?;
+    if project_skills_path.exists() {
+        let result = fs::read_dir(project_skills_path)?;
         for entry in result {
             let entry = entry?;
             if entry.path().is_dir() {
@@ -205,32 +243,27 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_ensure_skill_prefers_local_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let local_skills = tmp.path().join(".agents").join("skills").join("test-skill");
-        fs::create_dir_all(&local_skills).unwrap();
+        let local_skills = tmp.path().join(".agents").join("skills");
+        let local_skill = local_skills.join("test-skill");
+        fs::create_dir_all(&local_skill).unwrap();
         fs::write(
-            local_skills.join("SKILL.md"),
+            local_skill.join("SKILL.md"),
             "---\nname: test\ndescription: local\n---\n",
         )
         .unwrap();
 
-        // Override global path to something else so local wins
-        let global_skills = tmp.path().join("global").join("skills").join("test-skill");
-        fs::create_dir_all(&global_skills).unwrap();
+        let global_skills = tmp.path().join("global").join("skills");
+        let global_skill = global_skills.join("test-skill");
+        fs::create_dir_all(&global_skill).unwrap();
         fs::write(
-            global_skills.join("SKILL.md"),
+            global_skill.join("SKILL.md"),
             "---\nname: test\ndescription: global\n---\n",
         )
         .unwrap();
 
-        // We can't easily override OnceLock in tests, but we can at least verify
-        // that a local path is returned when it exists by temporarily changing CWD
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
-        let result = ensure_skill("test-skill");
-        std::env::set_current_dir(original).unwrap();
+        let result = ensure_skill_with_paths(&local_skills, &global_skills, "test-skill");
 
         let path = result.unwrap();
         let path_str = path.to_string_lossy();
@@ -241,12 +274,37 @@ mod tests {
 
     #[test]
     fn test_ensure_skill_not_found() {
-        let result = ensure_skill("definitely-nonexistent-skill-12345");
+        let tmp = tempfile::tempdir().unwrap();
+        let result = ensure_skill_with_paths(
+            &tmp.path().join("local-skills"),
+            &tmp.path().join("global-skills"),
+            "definitely-nonexistent-skill-12345",
+        );
         assert!(result.is_none());
     }
 
     #[test]
-    #[serial_test::serial]
+    fn test_ensure_skill_rejects_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_skills = tmp.path().join("project-skills");
+        let outside_skill = tmp.path().join("outside-skill");
+        fs::create_dir_all(&project_skills).unwrap();
+        fs::create_dir_all(&outside_skill).unwrap();
+        write_skill_md(
+            &outside_skill,
+            "---\nname: outside\ndescription: outside\n---\n",
+        );
+
+        let result = ensure_skill_with_paths(
+            &project_skills,
+            &tmp.path().join("global-skills"),
+            "../outside-skill",
+        );
+
+        assert!(result.is_none());
+    }
+
+    #[test]
     fn test_find_skills_local_only() {
         let tmp = tempfile::tempdir().unwrap();
         let skills_dir = tmp.path().join(".agents").join("skills");
@@ -260,10 +318,8 @@ mod tests {
         fs::create_dir(&skill_b).unwrap();
         write_skill_md(&skill_b, "---\nname: skill-b\ndescription: Skill B\n---\n");
 
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
-        let skills = find_skills().unwrap();
-        std::env::set_current_dir(original).unwrap();
+        let skills =
+            find_skills_with_paths(&skills_dir, &tmp.path().join("global-skills")).unwrap();
 
         // Only count skills that came from our temp directory
         let local_skills: Vec<_> = skills
@@ -277,19 +333,14 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_find_skills_empty_when_no_dirs() {
         let tmp = tempfile::tempdir().unwrap();
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
-        let skills = find_skills().unwrap();
-        std::env::set_current_dir(original).unwrap();
-        // Only count skills that came from our temp directory
-        let local_skills: Vec<_> = skills
-            .into_iter()
-            .filter(|(name, _)| name.starts_with("test-"))
-            .collect();
-        assert!(local_skills.is_empty());
+        let skills = find_skills_with_paths(
+            &tmp.path().join("local-skills"),
+            &tmp.path().join("global-skills"),
+        )
+        .unwrap();
+        assert!(skills.is_empty());
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fmt::{self, Debug},
     fs, io,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
 };
@@ -37,18 +38,18 @@ use crate::{
     common::{
         call_tool, check_env_var, convert_event_to_message, get_incomplete_tasks, load_agents_md,
     },
-    skills::{self, ensure_skill, find_skills, parse_skill},
+    skills::{self, ensure_skill_with_project_path, find_skills_with_project_path, parse_skill},
     types::{Agent, AgentError, GenerationStream, RunStream, ToolExecutionContext, ToolFunction},
 };
 
-/// Relative path to the project-local skills directory.
-pub const SKILLS_PATH: &str = ".agents/skills";
+/// Relative path to the default project-local skills directory.
+pub use crate::skills::SKILLS_PATH;
+/// Path alias for the default global skills directory (resolved at runtime).
+pub const GLOBAL_SKILLS_PATH: &str = "~/.agents/skills";
 /// Name of the built-in skill-loading tool exposed to the LLM.
 pub const SKILLS_TOOL_NAME: &str = "skills";
 /// Name of the built-in task tracking tool exposed to the LLM.
 pub const TASKS_TOOL_NAME: &str = "tasks";
-/// Path alias for the global skills directory (resolved at runtime).
-pub const GLOBAL_SKILLS_PATH: &str = "~/.agents/skills";
 /// Base system prompt injected into every conversation.
 pub const BASE_SYSTEM_PROMPT: &str = r#"<identity>
 You are MicroAgent, an AI agent whose purpose is to
@@ -87,6 +88,48 @@ seems compelling enough for the task at hand.
 /// Maximum number of tool calls executed concurrently when
 /// `parallel_tool_calls` is enabled.
 const MAX_CONCURRENT_TOOL_CALLS: usize = 10;
+
+async fn persist_event(
+    storage: &dyn AgentStorage,
+    event: &AgentEventAny,
+) -> Result<(), AgentError> {
+    storage
+        .update_session(event.clone())
+        .await
+        .map_err(|error| {
+            AgentError::RunError(format!(
+                "An error occurred while updating the session in the storage: {error}"
+            ))
+        })
+}
+
+fn assistant_message_parts(message: &Message) -> Result<Vec<AssistantMessagePart>, AgentError> {
+    message
+        .content
+        .iter()
+        .map(|part| match part {
+            MessagePart::Text(text) => Ok(AssistantMessagePart::Text(AssistantTextPart {
+                text: text.text.clone(),
+            })),
+            MessagePart::Thinking(thinking) => {
+                Ok(AssistantMessagePart::Thinking(AssistantThinkingPart {
+                    thinking: thinking.thinking.clone(),
+                    signature: thinking.signature.clone(),
+                }))
+            }
+            MessagePart::ToolCall(tool_call) => {
+                Ok(AssistantMessagePart::ToolCall(AssistantToolCallPart {
+                    id: tool_call.id.clone(),
+                    name: tool_call.name.clone(),
+                    arguments: tool_call.arguments.clone(),
+                }))
+            }
+            _ => Err(AgentError::RunError(
+                "Assistant response contains an unsupported message part".to_string(),
+            )),
+        })
+        .collect()
+}
 
 /// Supported LLM providers.
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Default)]
@@ -160,6 +203,8 @@ impl SupportedProvider {
 pub enum MicroAgentBuilderError {
     #[error("Skill {0} not found")]
     SkillNotFound(String),
+    #[error("Invalid skill name {0}")]
+    InvalidSkillName(String),
     #[error("Skill parsing error")]
     SkillParsingError(#[from] skills::SkillLoadingError),
     #[error("Provider {0} not supported")]
@@ -184,6 +229,7 @@ pub struct MicroAgent<Ctx> {
     pub history: Vec<Message>,
     pub tools: HashMap<String, Arc<dyn ToolFunction<Ctx>>>,
     pub skills: HashMap<String, String>,
+    skills_path: PathBuf,
     pub provider: SupportedProvider,
     pub base_url: Option<String>,
     pub model: String,
@@ -204,6 +250,7 @@ impl<Ctx: Debug> Debug for MicroAgent<Ctx> {
             .field("base_url", &self.base_url)
             .field("tools", &self.tools)
             .field("skills", &self.skills)
+            .field("skills_path", &self.skills_path)
             .field("provider", &self.provider)
             .field("model", &self.model)
             .field("system", &self.system)
@@ -235,6 +282,7 @@ pub struct MicroAgentBuilder<Ctx> {
     provider: SupportedProvider,
     model: String,
     custom_instructions: String,
+    skills_path: PathBuf,
     tool_context: Arc<ToolExecutionContext<Ctx>>,
     base_url: Option<String>,
     prompt_cache: bool,
@@ -262,6 +310,7 @@ impl<Ctx: Send + Sync + 'static> MicroAgentBuilder<Ctx> {
             provider: SupportedProvider::default(),
             model: String::new(),
             custom_instructions: String::new(),
+            skills_path: PathBuf::from(SKILLS_PATH),
             tool_context: Arc::new(tool_context),
             storage: Box::new(InMemoryAgentStorage::default()) as Box<dyn AgentStorage>,
             parallel_tool_calls: false,
@@ -272,28 +321,47 @@ impl<Ctx: Send + Sync + 'static> MicroAgentBuilder<Ctx> {
 
     /// Register a single skill by name.
     ///
-    /// Searches `.agents/skills/{name}` then `~/.agents/skills/{name}`.
+    /// Searches the configured project skills directory first, then
+    /// `~/.agents/skills/{name}`.
     pub fn add_skill(
         mut self,
         skill_name: impl Into<String>,
     ) -> Result<Self, MicroAgentBuilderError> {
         let skill_name = skill_name.into();
-        if let Some(skill_path) = ensure_skill(&skill_name) {
-            let description = parse_skill(&skill_path)?;
+        if !skills::is_valid_skill_name(&skill_name) {
+            return Err(MicroAgentBuilderError::InvalidSkillName(skill_name));
+        }
+        if let Some(skill_path) = ensure_skill_with_project_path(&self.skills_path, &skill_name) {
+            let description = parse_skill(&skill_path.join("SKILL.md"))?;
             self.skills.insert(skill_name, description);
             return Ok(self);
         }
         Err(MicroAgentBuilderError::SkillNotFound(skill_name))
     }
 
-    /// Auto-discover and register all skills found in the local and global
-    /// skills directories.
+    /// Auto-discover and register all skills found in the configured project
+    /// and global skills directories.
     pub fn find_skills(mut self) -> Result<Self, MicroAgentBuilderError> {
-        let loaded_skills = find_skills()?;
+        let loaded_skills = find_skills_with_project_path(&self.skills_path)?;
         for (skill, des) in loaded_skills {
             self.skills.insert(skill, des);
         }
         Ok(self)
+    }
+
+    /// Set the project-local skills directory.
+    ///
+    /// This directory takes precedence over `~/.agents/skills` and replaces
+    /// the default `.agents/skills` lookup directory for this agent.
+    pub fn skills_path(mut self, skills_path: impl Into<PathBuf>) -> Self {
+        self.skills_path = skills_path.into();
+        self.tools.insert(
+            SKILLS_TOOL_NAME.to_string(),
+            Arc::new(ConfiguredSkillsTool {
+                skills_path: self.skills_path.clone(),
+            }) as Arc<dyn ToolFunction<Ctx>>,
+        );
+        self
     }
 
     /// Set the LLM provider (`"openai"` or `"anthropic"`).
@@ -354,7 +422,11 @@ impl<Ctx: Send + Sync + 'static> MicroAgentBuilder<Ctx> {
         mut self,
         tool: Arc<dyn ToolFunction<Ctx>>,
     ) -> Result<Self, MicroAgentBuilderError> {
-        self.tools.insert(tool.name().to_owned(), tool);
+        let name = tool.name();
+        if self.tools.contains_key(name) {
+            return Err(MicroAgentBuilderError::ToolAlreadyDefined(name.to_owned()));
+        }
+        self.tools.insert(name.to_owned(), tool);
         Ok(self)
     }
 
@@ -461,6 +533,7 @@ You are {} provided by {}
             base_url: self.resolve_base_url(),
             tools: self.tools,
             skills: self.skills,
+            skills_path: self.skills_path,
             model,
             api_key,
             provider: self.provider,
@@ -484,7 +557,7 @@ impl<Ctx> MicroAgent<Ctx> {
                 .map(|s| s.trim_start_matches("/"))
                 .unwrap_or("");
             if self.skills.contains_key(skill) {
-                let skill_path = ensure_skill(skill);
+                let skill_path = ensure_skill_with_project_path(&self.skills_path, skill);
                 match skill_path {
                     Some(p) => {
                         let content = fs::read_to_string(p.join("SKILL.md"))
@@ -506,9 +579,46 @@ impl<Ctx> MicroAgent<Ctx> {
 #[derive(Debug)]
 pub struct SkillsTool;
 
+#[derive(Debug)]
+struct ConfiguredSkillsTool {
+    skills_path: PathBuf,
+}
+
 /// Built-in tool that track agent tasks
 #[derive(Debug)]
 pub struct TasksTool;
+
+fn load_skill(skill_name: &str, skills_path: &Path) -> Result<ToolResult, AgentError> {
+    if !skills::is_valid_skill_name(skill_name) {
+        return Ok(ToolResult::Err(format!(
+            "Skill name {skill_name:?} is invalid"
+        )));
+    }
+    if let Some(path) = ensure_skill_with_project_path(skills_path, skill_name) {
+        let content = fs::read_to_string(path.join("SKILL.md")).map_err(|error| {
+            AgentError::ToolCallError(format!("Skill {skill_name} could not be read: {error}"))
+        })?;
+        return Ok(ToolResult::Ok(content));
+    }
+    Ok(ToolResult::Err(format!(
+        "Skill {skill_name} could not be found"
+    )))
+}
+
+fn skills_tool_input_schema() -> Value {
+    json!({
+      "type": "object",
+      "required": [
+        "skill_name"
+      ],
+      "properties": {
+        "skill_name": {
+          "type": "string",
+          "description": "Name of the skill to load"
+        }
+      }
+    })
+}
 
 #[async_trait::async_trait]
 impl<Ctx: Send + Sync + 'static> ToolFunction<Ctx> for SkillsTool {
@@ -521,18 +631,7 @@ impl<Ctx: Send + Sync + 'static> ToolFunction<Ctx> for SkillsTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        json!({
-          "type": "object",
-          "required": [
-            "skill_name"
-          ],
-          "properties": {
-            "skill_name": {
-              "type": "string",
-              "description": "Name of the skill to load"
-            }
-          }
-        })
+        skills_tool_input_schema()
     }
 
     async fn execute(
@@ -543,16 +642,33 @@ impl<Ctx: Send + Sync + 'static> ToolFunction<Ctx> for SkillsTool {
         let skill_name = input["skill_name"]
             .as_str()
             .ok_or_else(|| AgentError::ToolCallError("missing skill_name".into()))?;
-        let skill_path = ensure_skill(skill_name);
-        if let Some(p) = skill_path {
-            let content = fs::read_to_string(p.join("SKILL.md")).map_err(|e| {
-                AgentError::ToolCallError(format!("Skill {skill_name} could not be read: {}", e))
-            })?;
-            return Ok(ToolResult::Ok(content));
-        }
-        Ok(ToolResult::Err(format!(
-            "Skill {skill_name} could not be found"
-        )))
+        load_skill(skill_name, Path::new(SKILLS_PATH))
+    }
+}
+
+#[async_trait::async_trait]
+impl<Ctx: Send + Sync + 'static> ToolFunction<Ctx> for ConfiguredSkillsTool {
+    fn name(&self) -> &'static str {
+        SKILLS_TOOL_NAME
+    }
+
+    fn description(&self) -> &'static str {
+        "Call this tool to load a skill, providing the name of the skill you are invoking"
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        skills_tool_input_schema()
+    }
+
+    async fn execute(
+        &self,
+        input: Value,
+        _ctx: &Arc<ToolExecutionContext<Ctx>>,
+    ) -> Result<ToolResult, AgentError> {
+        let skill_name = input["skill_name"]
+            .as_str()
+            .ok_or_else(|| AgentError::ToolCallError("missing skill_name".into()))?;
+        load_skill(skill_name, &self.skills_path)
     }
 }
 
@@ -641,7 +757,7 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
             .map_err(|e| AgentError::GenerationError(e.to_string()))?;
         let mapped =
             stream.map(|item| item.map_err(|e| AgentError::GenerationError(e.to_string())));
-        return Ok(Box::pin(mapped));
+        Ok(Box::pin(mapped))
     }
 
     /// Run a complete conversation turn.
@@ -744,13 +860,10 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                 prompt,
                 timestamp: Utc::now(),
             });
-            match self.storage.update_session(user_prompt_submit.clone()).await {
-                Ok(_) => {},
-                Err(e) => {
-                    yield Err(AgentError::RunError(format!("An error occurred while updating the session in the storage: {}", e)));
+                if let Err(error) = persist_event(self.storage.as_ref(), &user_prompt_submit).await {
+                    yield Err(error);
                     return;
                 }
-            };
             yield Ok(user_prompt_submit);
 
             loop {
@@ -776,12 +889,9 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                                             delta_type: DeltaType::Text,
                                             timestamp: Utc::now(),
                                         });
-                                        match self.storage.update_session(ev.clone()).await {
-                                            Ok(_) => {},
-                                            Err(e) => {
-                                                yield Err(AgentError::RunError(format!("An error occurred while updating the session in the storage: {}", e)));
-                                                return;
-                                            }
+                                        if let Err(error) = persist_event(self.storage.as_ref(), &ev).await {
+                                            yield Err(error);
+                                            return;
                                         }
                                         yield Ok(ev);
                                     }
@@ -796,12 +906,9 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                                             delta_type: DeltaType::Thinking,
                                             timestamp: Utc::now(),
                                         });
-                                        match self.storage.update_session(ev.clone()).await {
-                                            Ok(_) => {},
-                                            Err(e) => {
-                                                yield Err(AgentError::RunError(format!("An error occurred while updating the session in the storage: {}", e)));
-                                                return;
-                                            }
+                                        if let Err(error) = persist_event(self.storage.as_ref(), &ev).await {
+                                            yield Err(error);
+                                            return;
                                         }
                                         yield Ok(ev);
                                     }
@@ -828,12 +935,9 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                                     Some(ts.keys().map(|k| k.to_string()).collect())
                                 }
                             }});
-                            match self.storage.update_session(stop_ev.clone()).await {
-                                Ok(_) => {},
-                                Err(e) => {
-                                    yield Err(AgentError::RunError(format!("An error occurred while starting the generation stream: {}", e)));
-                                    return;
-                                }
+                            if let Err(error) = persist_event(self.storage.as_ref(), &stop_ev).await {
+                                yield Err(error);
+                                return;
                             }
                             yield Ok(stop_ev);
                             return;
@@ -841,41 +945,30 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                     }
                 }
 
-                let Some(final_message) = assistant_message.clone() else {
+                let Some(final_message) = assistant_message.take() else {
                     yield Err(AgentError::RunError("LLM stream did not produce a full message".to_string()));
                     return;
                 };
 
                 if tool_calls.is_empty() {
                     usage.latency = (Utc::now() - start_processing).num_milliseconds();
+                    let content = match assistant_message_parts(&final_message) {
+                        Ok(content) => content,
+                        Err(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    };
                     let ev = AgentEventAny::AssistantResponse(AssistantResponseEvent {
                         session_id: resolved_sid.clone(),
                         turn_id: turn_id.clone(),
-                        content: final_message.content.iter().map(|c| match c {
-                            MessagePart::Text(t) => AssistantMessagePart::Text(AssistantTextPart { text: t.text.clone() }),
-                            MessagePart::Thinking(t) => AssistantMessagePart::Thinking(AssistantThinkingPart { thinking: t.thinking.clone(), signature: t.signature.clone()}),
-                            MessagePart::ToolCall(t) => AssistantMessagePart::ToolCall(AssistantToolCallPart {
-                                id: t.id.clone(),
-                                name: t.name.clone(),
-                                arguments: t.arguments.clone(),
-                            }),
-                            _ => unreachable!("Should not reach this branch")
-                        }).collect(),
+                        content: content.clone(),
                         timestamp: Utc::now(),
                     });
                     let stop_ev = AgentEventAny::SessionStop(SessionStopEvent {
                         session_id: resolved_sid.clone(),
                         success: true,
-                        result: Some(final_message.content.iter().map(|c| match c {
-                            MessagePart::Text(t) => AssistantMessagePart::Text(AssistantTextPart { text: t.text.clone() }),
-                            MessagePart::Thinking(t) => AssistantMessagePart::Thinking(AssistantThinkingPart { thinking: t.thinking.clone(), signature: t.signature.clone()}),
-                            MessagePart::ToolCall(t) => AssistantMessagePart::ToolCall(AssistantToolCallPart {
-                                id: t.id.clone(),
-                                name: t.name.clone(),
-                                arguments: t.arguments.clone(),
-                            }),
-                            _ => unreachable!("Should not reach this branch")
-                        }).collect()),
+                        result: Some(content),
                         error: None,
                         timestamp: Utc::now(),
                         usage,
@@ -888,19 +981,13 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                             }
                         }
                     });
-                    match self.storage.update_session(ev.clone()).await {
-                        Ok(_) => {},
-                        Err(e) => {
-                            yield Err(AgentError::RunError(format!("An error occurred while starting the generation stream: {}", e)));
-                            return;
-                        }
+                    if let Err(error) = persist_event(self.storage.as_ref(), &ev).await {
+                        yield Err(error);
+                        return;
                     }
-                    match self.storage.update_session(stop_ev.clone()).await {
-                        Ok(_) => {},
-                        Err(e) => {
-                            yield Err(AgentError::RunError(format!("An error occurred while starting the generation stream: {}", e)));
-                            return;
-                        }
+                    if let Err(error) = persist_event(self.storage.as_ref(), &stop_ev).await {
+                        yield Err(error);
+                        return;
                     }
                     yield Ok(ev);
                     yield Ok(stop_ev);
@@ -916,7 +1003,16 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                 };
                 let semaphore = Arc::new(Semaphore::new(concurrency));
                 for tc in tool_calls {
-                            let v: Value = serde_json::from_str(&tc.arguments).expect("Arguments should be serializable");
+                            let v: Value = match serde_json::from_str(&tc.arguments) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    yield Err(AgentError::RunError(format!(
+                                        "Tool {} returned invalid JSON arguments: {error}",
+                                        tc.name
+                                    )));
+                                    return;
+                                }
+                            };
                             let tool = local_tools.get(&tc.name);
                             if let Some(t) = tool {
                                 let tool_name = tc.name.clone();
@@ -928,12 +1024,9 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                                     timestamp: Utc::now(),
                                     tool_call_id: tc.id.clone(),
                                 });
-                                match self.storage.update_session(tc_any_ev.clone()).await {
-                                    Ok(_) => {},
-                                    Err(e) => {
-                                        yield Err(AgentError::RunError(format!("An error occurred while updating the session in the storage: {}", e)));
-                                        return;
-                                    }
+                                if let Err(error) = persist_event(self.storage.as_ref(), &tc_any_ev).await {
+                                    yield Err(error);
+                                    return;
                                 }
                                 let tc_ev = if tool_name != SKILLS_TOOL_NAME && tool_name != TASKS_TOOL_NAME {
                                     AgentEventAny::ToolCall(ToolCallEvent {
@@ -986,12 +1079,9 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                                         timestamp: Utc::now(),
                                     })
                                 };
-                                match self.storage.update_session(tc_ev.clone()).await {
-                                    Ok(_) => {},
-                                    Err(e) => {
-                                        yield Err(AgentError::RunError(format!("An error occurred while updating the session in the storage: {}", e)));
-                                        return;
-                                    }
+                                if let Err(error) = persist_event(self.storage.as_ref(), &tc_ev).await {
+                                    yield Err(error);
+                                    return;
                                 }
                                 yield Ok(tc_ev);
                                 let permit_res = semaphore.clone().acquire_owned().await;
@@ -1025,12 +1115,9 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                                 tool_call_id: tid.clone(),
                                 timestamp: Utc::now(),
                             });
-                            match self.storage.update_session(ev.clone()).await {
-                                Ok(_) => {},
-                                Err(e) => {
-                                    yield Err(AgentError::RunError(format!("An error occurred while updating the session in the storage: {}", e)));
-                                    return;
-                                }
+                            if let Err(error) = persist_event(self.storage.as_ref(), &ev).await {
+                                yield Err(error);
+                                return;
                             }
                             yield Ok(ev);
                             let content = match tool_result {
@@ -1040,7 +1127,12 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                                 ToolResult::Err(r) => {
                                     format!("Tool failed: {r}")
                                 },
-                                _ => unreachable!("ToolResult should not reach this branch")
+                                _ => {
+                                    yield Err(AgentError::RunError(
+                                        "Tool returned an unsupported result".to_string(),
+                                    ));
+                                    return;
+                                }
                             };
                             tool_messages.push(Message { role: MessageRole::Tool, content: vec![MessagePart::ToolResult(ToolResultPart {
                                 tool_call_id: tid,
@@ -1275,6 +1367,140 @@ mod tests {
             .unwrap();
         assert_eq!(builder.tools.len(), 3);
         assert!(builder.tools.contains_key("dummy"));
+    }
+
+    #[test]
+    fn test_builder_add_tool_rejects_duplicate_name() {
+        let result = MicroAgentBuilder::new(ToolExecutionContext::new(()))
+            .add_tool(Arc::new(DummyTool))
+            .and_then(|builder| builder.add_tool(Arc::new(DummyTool)));
+
+        assert!(matches!(
+            result,
+            Err(MicroAgentBuilderError::ToolAlreadyDefined(name)) if name == "dummy"
+        ));
+    }
+
+    #[test]
+    fn test_builder_add_skill_uses_configured_skills_path() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let skills_path = temp.path().join("project-skills");
+        let skill_path = skills_path.join("configured-skill");
+        std::fs::create_dir_all(&skill_path).expect("skill directory should be created");
+        std::fs::write(
+            skill_path.join("SKILL.md"),
+            "---\nname: configured-skill\ndescription: configured\n---\n",
+        )
+        .expect("skill file should be written");
+
+        let builder = MicroAgentBuilder::new(ToolExecutionContext::new(()))
+            .skills_path(&skills_path)
+            .add_skill("configured-skill")
+            .expect("skill should be loaded from the configured path");
+
+        assert_eq!(
+            builder.skills.get("configured-skill"),
+            Some(&"configured".to_string())
+        );
+    }
+
+    #[test]
+    fn test_builder_add_skill_rejects_invalid_name() {
+        let result = MicroAgentBuilder::new(ToolExecutionContext::new(())).add_skill("../outside");
+
+        assert!(matches!(
+            result,
+            Err(MicroAgentBuilderError::InvalidSkillName(name)) if name == "../outside"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_configured_skills_tool_uses_configured_skills_path() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let skills_path = temp.path().join("project-skills");
+        let skill_path = skills_path.join("configured-skill");
+        std::fs::create_dir_all(&skill_path).expect("skill directory should be created");
+        std::fs::write(skill_path.join("SKILL.md"), "configured skill content")
+            .expect("skill file should be written");
+
+        let builder =
+            MicroAgentBuilder::new(ToolExecutionContext::new(())).skills_path(&skills_path);
+        let skills_tool = builder
+            .tools
+            .get(SKILLS_TOOL_NAME)
+            .expect("skills tool should be registered");
+        let result = skills_tool
+            .execute(
+                json!({"skill_name": "configured-skill"}),
+                &builder.tool_context,
+            )
+            .await
+            .expect("skills tool should load from the configured path");
+
+        assert!(matches!(result, ToolResult::Ok(content) if content == "configured skill content"));
+    }
+
+    #[tokio::test]
+    async fn test_configured_skills_tool_rejects_path_traversal() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let skills_path = temp.path().join("project-skills");
+        let outside_skill = temp.path().join("outside-skill");
+        std::fs::create_dir_all(&skills_path).expect("project skills directory should be created");
+        std::fs::create_dir_all(&outside_skill).expect("outside skill directory should be created");
+        std::fs::write(outside_skill.join("SKILL.md"), "outside skill content")
+            .expect("outside skill file should be written");
+
+        let builder =
+            MicroAgentBuilder::new(ToolExecutionContext::new(())).skills_path(&skills_path);
+        let skills_tool = builder
+            .tools
+            .get(SKILLS_TOOL_NAME)
+            .expect("skills tool should be registered");
+        let result = skills_tool
+            .execute(
+                json!({"skill_name": "../outside-skill"}),
+                &builder.tool_context,
+            )
+            .await
+            .expect("invalid skill names are reported as tool results");
+
+        assert!(matches!(result, ToolResult::Err(message) if message.contains("invalid")));
+    }
+
+    #[tokio::test]
+    async fn test_persist_event_returns_run_error_when_storage_update_fails() {
+        let storage = InMemoryAgentStorage::default();
+        let event = AgentEventAny::UserPromptSubmit(UserPromptSubmitEvent {
+            session_id: "missing-session".to_string(),
+            turn_id: "turn-1".to_string(),
+            prompt: "hello".to_string(),
+            timestamp: Utc::now(),
+        });
+
+        let error = persist_event(&storage, &event)
+            .await
+            .expect_err("updating an unknown session must fail");
+
+        assert!(
+            matches!(error, AgentError::RunError(message) if message.contains("updating the session"))
+        );
+    }
+
+    #[test]
+    fn test_assistant_message_parts_converts_text() {
+        let message = Message {
+            role: MessageRole::Assistant,
+            content: vec![MessagePart::Text(TextPart::new("hello"))],
+        };
+
+        let parts = assistant_message_parts(&message).expect("text is a supported assistant part");
+
+        assert_eq!(
+            parts,
+            vec![AssistantMessagePart::Text(AssistantTextPart {
+                text: "hello".to_string(),
+            })]
+        );
     }
 
     #[tokio::test]
