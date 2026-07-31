@@ -8,7 +8,11 @@ use chrono::{DateTime, Utc};
 use llms_sdk::{
     Message, MessagePart, MessageRole, TextPart, ThinkingPart, ToolCallPart, ToolResultPart,
 };
-use microagents_events::{AgentEventAny, AssistantMessagePart, TaskStatus, types::ToolResult};
+use microagents_events::{
+    AgentEventAny, AssistantMessagePart, TaskStatus, TextPart as AssistantTextPart,
+    ThinkingPart as AssistantThinkingPart, ToolCallPart as AssistantToolCallPart,
+    types::ToolResult,
+};
 use serde_json::Value;
 
 use crate::{
@@ -24,6 +28,37 @@ const AGENTS_MD: &str = "AGENTS.md";
 pub fn check_env_var(api_key: &str) -> Result<String, std::env::VarError> {
     let v = std::env::var(api_key)?;
     Ok(v)
+}
+
+/// Convert an SDK assistant message into persisted assistant message parts.
+pub fn convert_message_to_assistant_parts(
+    message: &Message,
+) -> Result<Vec<AssistantMessagePart>, AgentError> {
+    message
+        .content
+        .iter()
+        .map(|part| match part {
+            MessagePart::Text(text) => Ok(AssistantMessagePart::Text(AssistantTextPart {
+                text: text.text.clone(),
+            })),
+            MessagePart::Thinking(thinking) => {
+                Ok(AssistantMessagePart::Thinking(AssistantThinkingPart {
+                    thinking: thinking.thinking.clone(),
+                    signature: thinking.signature.clone(),
+                }))
+            }
+            MessagePart::ToolCall(tool_call) => {
+                Ok(AssistantMessagePart::ToolCall(AssistantToolCallPart {
+                    id: tool_call.id.clone(),
+                    name: tool_call.name.clone(),
+                    arguments: tool_call.arguments.clone(),
+                }))
+            }
+            _ => Err(AgentError::RunError(
+                "Assistant response contains an unsupported message part".to_string(),
+            )),
+        })
+        .collect()
 }
 
 /// Convert a persisted [`AgentEventAny`] back into an SDK [`Message`].
@@ -234,6 +269,24 @@ mod tests {
         let msg = convert_event_to_message(event).unwrap();
         assert_eq!(msg.role, MessageRole::Assistant);
         assert!(matches!(msg.content[0], MessagePart::Text(ref t) if t.text == "hi there"));
+    }
+
+    #[test]
+    fn test_convert_message_to_assistant_parts_converts_text() {
+        let message = Message {
+            role: MessageRole::Assistant,
+            content: vec![MessagePart::Text(TextPart::new("hello"))],
+        };
+
+        let parts = convert_message_to_assistant_parts(&message)
+            .expect("text is a supported assistant part");
+
+        assert_eq!(
+            parts,
+            vec![AssistantMessagePart::Text(AssistantTextPart {
+                text: "hello".to_string(),
+            })]
+        );
     }
 
     #[test]

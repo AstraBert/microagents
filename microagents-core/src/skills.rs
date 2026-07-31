@@ -91,7 +91,7 @@ pub fn parse_skill(skill_file: &Path) -> Result<String, SkillLoadingError> {
 /// Searches `.agents/skills/{name}` first, then `~/.agents/skills/{name}`.
 /// Returns `None` if the skill cannot be found in either location.
 pub fn ensure_skill(skill_name: &str) -> Option<PathBuf> {
-    ensure_skill_with_project_path(Path::new(SKILLS_PATH), skill_name)
+    ensure_skill_with_paths(Path::new(SKILLS_PATH), global_skills_path(), skill_name)
 }
 
 pub(crate) fn is_valid_skill_name(skill_name: &str) -> bool {
@@ -100,13 +100,6 @@ pub(crate) fn is_valid_skill_name(skill_name: &str) -> bool {
         && Path::new(skill_name)
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
-}
-
-pub(crate) fn ensure_skill_with_project_path(
-    project_skills_path: &Path,
-    skill_name: &str,
-) -> Option<PathBuf> {
-    ensure_skill_with_paths(project_skills_path, global_skills_path(), skill_name)
 }
 
 fn ensure_skill_with_paths(
@@ -132,13 +125,7 @@ fn ensure_skill_with_paths(
 ///
 /// Duplicates are removed; local skills shadow global ones.
 pub fn find_skills() -> Result<HashMap<String, String>, SkillLoadingError> {
-    find_skills_with_project_path(Path::new(SKILLS_PATH))
-}
-
-pub(crate) fn find_skills_with_project_path(
-    project_skills_path: &Path,
-) -> Result<HashMap<String, String>, SkillLoadingError> {
-    find_skills_with_paths(project_skills_path, global_skills_path())
+    find_skills_with_paths(Path::new(SKILLS_PATH), global_skills_path())
 }
 
 fn find_skills_with_paths(

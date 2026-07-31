@@ -2,7 +2,6 @@ use std::{
     collections::HashMap,
     fmt::{self, Debug},
     fs, io,
-    path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
 };
@@ -15,11 +14,9 @@ use llms_sdk::{
     Tool, ToolCallPart, ToolResultPart,
 };
 use microagents_events::{
-    AgentEventAny, AssistantMessagePart, AssistantResponseEvent, DeltaType, SessionInitEvent,
-    SessionInitType, SessionStopEvent, SkillLoadEvent, StreamDeltaEvent, TaskEvent, TaskStatus,
-    TextPart as AssistantTextPart, ThinkingPart as AssistantThinkingPart, ToolCallAnyEvent,
-    ToolCallEvent, ToolCallPart as AssistantToolCallPart, ToolResultEvent, Usage,
-    UserPromptSubmitEvent, types::ToolResult,
+    AgentEventAny, AssistantResponseEvent, DeltaType, SessionInitEvent, SessionInitType,
+    SessionStopEvent, SkillLoadEvent, StreamDeltaEvent, TaskEvent, TaskStatus, ToolCallAnyEvent,
+    ToolCallEvent, ToolResultEvent, Usage, UserPromptSubmitEvent, types::ToolResult,
 };
 use microagents_storage::{
     jsonl::JsonlAgentStorage,
@@ -36,9 +33,10 @@ use tokio::{
 
 use crate::{
     common::{
-        call_tool, check_env_var, convert_event_to_message, get_incomplete_tasks, load_agents_md,
+        call_tool, check_env_var, convert_event_to_message, convert_message_to_assistant_parts,
+        get_incomplete_tasks, load_agents_md,
     },
-    skills::{self, ensure_skill_with_project_path, find_skills_with_project_path, parse_skill},
+    skills::{self, ensure_skill, find_skills, parse_skill},
     types::{Agent, AgentError, GenerationStream, RunStream, ToolExecutionContext, ToolFunction},
 };
 
@@ -101,34 +99,6 @@ async fn persist_event(
                 "An error occurred while updating the session in the storage: {error}"
             ))
         })
-}
-
-fn assistant_message_parts(message: &Message) -> Result<Vec<AssistantMessagePart>, AgentError> {
-    message
-        .content
-        .iter()
-        .map(|part| match part {
-            MessagePart::Text(text) => Ok(AssistantMessagePart::Text(AssistantTextPart {
-                text: text.text.clone(),
-            })),
-            MessagePart::Thinking(thinking) => {
-                Ok(AssistantMessagePart::Thinking(AssistantThinkingPart {
-                    thinking: thinking.thinking.clone(),
-                    signature: thinking.signature.clone(),
-                }))
-            }
-            MessagePart::ToolCall(tool_call) => {
-                Ok(AssistantMessagePart::ToolCall(AssistantToolCallPart {
-                    id: tool_call.id.clone(),
-                    name: tool_call.name.clone(),
-                    arguments: tool_call.arguments.clone(),
-                }))
-            }
-            _ => Err(AgentError::RunError(
-                "Assistant response contains an unsupported message part".to_string(),
-            )),
-        })
-        .collect()
 }
 
 /// Supported LLM providers.
@@ -229,7 +199,6 @@ pub struct MicroAgent<Ctx> {
     pub history: Vec<Message>,
     pub tools: HashMap<String, Arc<dyn ToolFunction<Ctx>>>,
     pub skills: HashMap<String, String>,
-    skills_path: PathBuf,
     pub provider: SupportedProvider,
     pub base_url: Option<String>,
     pub model: String,
@@ -250,7 +219,6 @@ impl<Ctx: Debug> Debug for MicroAgent<Ctx> {
             .field("base_url", &self.base_url)
             .field("tools", &self.tools)
             .field("skills", &self.skills)
-            .field("skills_path", &self.skills_path)
             .field("provider", &self.provider)
             .field("model", &self.model)
             .field("system", &self.system)
@@ -282,7 +250,6 @@ pub struct MicroAgentBuilder<Ctx> {
     provider: SupportedProvider,
     model: String,
     custom_instructions: String,
-    skills_path: PathBuf,
     tool_context: Arc<ToolExecutionContext<Ctx>>,
     base_url: Option<String>,
     prompt_cache: bool,
@@ -310,7 +277,6 @@ impl<Ctx: Send + Sync + 'static> MicroAgentBuilder<Ctx> {
             provider: SupportedProvider::default(),
             model: String::new(),
             custom_instructions: String::new(),
-            skills_path: PathBuf::from(SKILLS_PATH),
             tool_context: Arc::new(tool_context),
             storage: Box::new(InMemoryAgentStorage::default()) as Box<dyn AgentStorage>,
             parallel_tool_calls: false,
@@ -321,12 +287,7 @@ impl<Ctx: Send + Sync + 'static> MicroAgentBuilder<Ctx> {
 
     /// Register a single skill by name.
     ///
-    /// Searches the configured project skills directory first, then
-    /// `~/.agents/skills/{name}`.
-    ///
-    /// Call [`Self::skills_path`] before this method when using a non-default
-    /// project skills directory. Registered skills are not re-resolved if the
-    /// path changes later.
+    /// Searches `.agents/skills/{name}` first, then `~/.agents/skills/{name}`.
     pub fn add_skill(
         mut self,
         skill_name: impl Into<String>,
@@ -335,7 +296,7 @@ impl<Ctx: Send + Sync + 'static> MicroAgentBuilder<Ctx> {
         if !skills::is_valid_skill_name(&skill_name) {
             return Err(MicroAgentBuilderError::InvalidSkillName(skill_name));
         }
-        if let Some(skill_path) = ensure_skill_with_project_path(&self.skills_path, &skill_name) {
+        if let Some(skill_path) = ensure_skill(&skill_name) {
             let description = parse_skill(&skill_path.join("SKILL.md"))?;
             self.skills.insert(skill_name, description);
             return Ok(self);
@@ -343,33 +304,14 @@ impl<Ctx: Send + Sync + 'static> MicroAgentBuilder<Ctx> {
         Err(MicroAgentBuilderError::SkillNotFound(skill_name))
     }
 
-    /// Auto-discover and register all skills found in the configured project
-    /// and global skills directories.
-    ///
-    /// Call [`Self::skills_path`] before this method when using a non-default
-    /// project skills directory. Discovered skills are not re-resolved if the
-    /// path changes later.
+    /// Auto-discover and register all skills found in the local and global
+    /// skills directories.
     pub fn find_skills(mut self) -> Result<Self, MicroAgentBuilderError> {
-        let loaded_skills = find_skills_with_project_path(&self.skills_path)?;
+        let loaded_skills = find_skills()?;
         for (skill, des) in loaded_skills {
             self.skills.insert(skill, des);
         }
         Ok(self)
-    }
-
-    /// Set the project-local skills directory.
-    ///
-    /// This directory takes precedence over `~/.agents/skills` and replaces
-    /// the default `.agents/skills` lookup directory for this agent.
-    pub fn skills_path(mut self, skills_path: impl Into<PathBuf>) -> Self {
-        self.skills_path = skills_path.into();
-        self.tools.insert(
-            SKILLS_TOOL_NAME.to_string(),
-            Arc::new(ConfiguredSkillsTool {
-                skills_path: self.skills_path.clone(),
-            }) as Arc<dyn ToolFunction<Ctx>>,
-        );
-        self
     }
 
     /// Set the LLM provider (`"openai"` or `"anthropic"`).
@@ -541,7 +483,6 @@ You are {} provided by {}
             base_url: self.resolve_base_url(),
             tools: self.tools,
             skills: self.skills,
-            skills_path: self.skills_path,
             model,
             api_key,
             provider: self.provider,
@@ -565,7 +506,7 @@ impl<Ctx> MicroAgent<Ctx> {
                 .map(|s| s.trim_start_matches("/"))
                 .unwrap_or("");
             if self.skills.contains_key(skill) {
-                let skill_path = ensure_skill_with_project_path(&self.skills_path, skill);
+                let skill_path = ensure_skill(skill);
                 match skill_path {
                     Some(p) => {
                         let content = fs::read_to_string(p.join("SKILL.md"))
@@ -587,22 +528,17 @@ impl<Ctx> MicroAgent<Ctx> {
 #[derive(Debug)]
 pub struct SkillsTool;
 
-#[derive(Debug)]
-struct ConfiguredSkillsTool {
-    skills_path: PathBuf,
-}
-
 /// Built-in tool that track agent tasks
 #[derive(Debug)]
 pub struct TasksTool;
 
-fn load_skill(skill_name: &str, skills_path: &Path) -> Result<ToolResult, AgentError> {
+fn load_skill(skill_name: &str) -> Result<ToolResult, AgentError> {
     if !skills::is_valid_skill_name(skill_name) {
         return Ok(ToolResult::Err(format!(
             "Skill name {skill_name:?} is invalid"
         )));
     }
-    if let Some(path) = ensure_skill_with_project_path(skills_path, skill_name) {
+    if let Some(path) = ensure_skill(skill_name) {
         let content = fs::read_to_string(path.join("SKILL.md")).map_err(|error| {
             AgentError::ToolCallError(format!("Skill {skill_name} could not be read: {error}"))
         })?;
@@ -650,33 +586,7 @@ impl<Ctx: Send + Sync + 'static> ToolFunction<Ctx> for SkillsTool {
         let skill_name = input["skill_name"]
             .as_str()
             .ok_or_else(|| AgentError::ToolCallError("missing skill_name".into()))?;
-        load_skill(skill_name, Path::new(SKILLS_PATH))
-    }
-}
-
-#[async_trait::async_trait]
-impl<Ctx: Send + Sync + 'static> ToolFunction<Ctx> for ConfiguredSkillsTool {
-    fn name(&self) -> &'static str {
-        SKILLS_TOOL_NAME
-    }
-
-    fn description(&self) -> &'static str {
-        "Call this tool to load a skill, providing the name of the skill you are invoking"
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        skills_tool_input_schema()
-    }
-
-    async fn execute(
-        &self,
-        input: Value,
-        _ctx: &Arc<ToolExecutionContext<Ctx>>,
-    ) -> Result<ToolResult, AgentError> {
-        let skill_name = input["skill_name"]
-            .as_str()
-            .ok_or_else(|| AgentError::ToolCallError("missing skill_name".into()))?;
-        load_skill(skill_name, &self.skills_path)
+        load_skill(skill_name)
     }
 }
 
@@ -960,7 +870,7 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
 
                 if tool_calls.is_empty() {
                     usage.latency = (Utc::now() - start_processing).num_milliseconds();
-                    let content = match assistant_message_parts(&final_message) {
+                    let content = match convert_message_to_assistant_parts(&final_message) {
                         Ok(content) => content,
                         Err(error) => {
                             yield Err(error);
@@ -1390,29 +1300,6 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_add_skill_uses_configured_skills_path() {
-        let temp = tempfile::tempdir().expect("temporary directory should be created");
-        let skills_path = temp.path().join("project-skills");
-        let skill_path = skills_path.join("configured-skill");
-        std::fs::create_dir_all(&skill_path).expect("skill directory should be created");
-        std::fs::write(
-            skill_path.join("SKILL.md"),
-            "---\nname: configured-skill\ndescription: configured\n---\n",
-        )
-        .expect("skill file should be written");
-
-        let builder = MicroAgentBuilder::new(ToolExecutionContext::new(()))
-            .skills_path(&skills_path)
-            .add_skill("configured-skill")
-            .expect("skill should be loaded from the configured path");
-
-        assert_eq!(
-            builder.skills.get("configured-skill"),
-            Some(&"configured".to_string())
-        );
-    }
-
-    #[test]
     fn test_builder_add_skill_rejects_invalid_name() {
         let result = MicroAgentBuilder::new(ToolExecutionContext::new(())).add_skill("../outside");
 
@@ -1423,52 +1310,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_configured_skills_tool_uses_configured_skills_path() {
-        let temp = tempfile::tempdir().expect("temporary directory should be created");
-        let skills_path = temp.path().join("project-skills");
-        let skill_path = skills_path.join("configured-skill");
-        std::fs::create_dir_all(&skill_path).expect("skill directory should be created");
-        std::fs::write(skill_path.join("SKILL.md"), "configured skill content")
-            .expect("skill file should be written");
+    async fn test_skills_tool_rejects_path_traversal() {
+        let tool = SkillsTool;
+        let context = Arc::new(ToolExecutionContext::new(()));
 
-        let builder =
-            MicroAgentBuilder::new(ToolExecutionContext::new(())).skills_path(&skills_path);
-        let skills_tool = builder
-            .tools
-            .get(SKILLS_TOOL_NAME)
-            .expect("skills tool should be registered");
-        let result = skills_tool
-            .execute(
-                json!({"skill_name": "configured-skill"}),
-                &builder.tool_context,
-            )
-            .await
-            .expect("skills tool should load from the configured path");
-
-        assert!(matches!(result, ToolResult::Ok(content) if content == "configured skill content"));
-    }
-
-    #[tokio::test]
-    async fn test_configured_skills_tool_rejects_path_traversal() {
-        let temp = tempfile::tempdir().expect("temporary directory should be created");
-        let skills_path = temp.path().join("project-skills");
-        let outside_skill = temp.path().join("outside-skill");
-        std::fs::create_dir_all(&skills_path).expect("project skills directory should be created");
-        std::fs::create_dir_all(&outside_skill).expect("outside skill directory should be created");
-        std::fs::write(outside_skill.join("SKILL.md"), "outside skill content")
-            .expect("outside skill file should be written");
-
-        let builder =
-            MicroAgentBuilder::new(ToolExecutionContext::new(())).skills_path(&skills_path);
-        let skills_tool = builder
-            .tools
-            .get(SKILLS_TOOL_NAME)
-            .expect("skills tool should be registered");
-        let result = skills_tool
-            .execute(
-                json!({"skill_name": "../outside-skill"}),
-                &builder.tool_context,
-            )
+        let result = tool
+            .execute(json!({"skill_name": "../outside-skill"}), &context)
             .await
             .expect("invalid skill names are reported as tool results");
 
@@ -1491,23 +1338,6 @@ mod tests {
 
         assert!(
             matches!(error, AgentError::RunError(message) if message.contains("updating the session"))
-        );
-    }
-
-    #[test]
-    fn test_assistant_message_parts_converts_text() {
-        let message = Message {
-            role: MessageRole::Assistant,
-            content: vec![MessagePart::Text(TextPart::new("hello"))],
-        };
-
-        let parts = assistant_message_parts(&message).expect("text is a supported assistant part");
-
-        assert_eq!(
-            parts,
-            vec![AssistantMessagePart::Text(AssistantTextPart {
-                text: "hello".to_string(),
-            })]
         );
     }
 
