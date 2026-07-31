@@ -238,8 +238,8 @@ mod tests {
     use microagents_events::{
         AssistantResponseEvent, SessionInitEvent, SessionInitType, SessionStopEvent,
         SkillLoadEvent, StreamDeltaEvent, TaskEvent, TaskStatus, TextPart as AssistantTextPart,
-        ToolCallAnyEvent, ToolCallEvent, ToolCallPart as AssistantToolCallPart, ToolResultEvent,
-        Usage, UserPromptSubmitEvent,
+        ThinkingPart as AssistantThinkingPart, ToolCallAnyEvent, ToolCallEvent,
+        ToolCallPart as AssistantToolCallPart, ToolResultEvent, Usage, UserPromptSubmitEvent,
     };
     use serde_json::json;
 
@@ -285,6 +285,52 @@ mod tests {
             parts,
             vec![AssistantMessagePart::Text(AssistantTextPart {
                 text: "hello".to_string(),
+            })]
+        );
+    }
+
+    #[test]
+    fn test_convert_message_to_assistant_parts_converts_thinking() {
+        let message = Message {
+            role: MessageRole::Assistant,
+            content: vec![MessagePart::Thinking(ThinkingPart {
+                thinking: "reasoning".to_string(),
+                signature: Some("signature".to_string()),
+            })],
+        };
+
+        let parts = convert_message_to_assistant_parts(&message)
+            .expect("thinking is a supported assistant part");
+
+        assert_eq!(
+            parts,
+            vec![AssistantMessagePart::Thinking(AssistantThinkingPart {
+                thinking: "reasoning".to_string(),
+                signature: Some("signature".to_string()),
+            })]
+        );
+    }
+
+    #[test]
+    fn test_convert_message_to_assistant_parts_converts_tool_call() {
+        let message = Message {
+            role: MessageRole::Assistant,
+            content: vec![MessagePart::ToolCall(ToolCallPart {
+                id: "call-1".to_string(),
+                name: "read".to_string(),
+                arguments: r#"{"path":"README.md"}"#.to_string(),
+            })],
+        };
+
+        let parts = convert_message_to_assistant_parts(&message)
+            .expect("tool calls are supported assistant parts");
+
+        assert_eq!(
+            parts,
+            vec![AssistantMessagePart::ToolCall(AssistantToolCallPart {
+                id: "call-1".to_string(),
+                name: "read".to_string(),
+                arguments: r#"{"path":"README.md"}"#.to_string(),
             })]
         );
     }

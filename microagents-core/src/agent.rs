@@ -522,6 +522,26 @@ impl<Ctx> MicroAgent<Ctx> {
         }
         Ok(prompt.to_owned())
     }
+
+    async fn failed_session_stop_event(
+        &self,
+        session_id: &str,
+        usage: Usage,
+        error: String,
+    ) -> AgentEventAny {
+        let tasks = self.tasks.lock().await;
+        let incomplete_tasks = (!tasks.is_empty()).then(|| tasks.keys().cloned().collect());
+
+        AgentEventAny::SessionStop(SessionStopEvent {
+            session_id: session_id.to_string(),
+            success: false,
+            result: None,
+            error: Some(error),
+            timestamp: Utc::now(),
+            usage,
+            incomplete_tasks,
+        })
+    }
 }
 
 /// Built-in tool that loads skill instructions at runtime.
@@ -845,14 +865,9 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                         },
                         Err(e) => {
                             usage.latency = (Utc::now() - start_processing).num_milliseconds();
-                            let stop_ev = AgentEventAny::SessionStop(SessionStopEvent { session_id: resolved_sid.clone(), success: false, result: None, error: Some(e.to_string()), timestamp: Utc::now(), usage, incomplete_tasks: {
-                                let ts = self.tasks.lock().await;
-                                if ts.is_empty() {
-                                    None
-                                } else {
-                                    Some(ts.keys().map(|k| k.to_string()).collect())
-                                }
-                            }});
+                            let stop_ev = self
+                                .failed_session_stop_event(&resolved_sid, usage, e.to_string())
+                                .await;
                             if let Err(error) = persist_event(self.storage.as_ref(), &stop_ev).await {
                                 yield Err(error);
                                 return;
@@ -873,6 +888,13 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                     let content = match convert_message_to_assistant_parts(&final_message) {
                         Ok(content) => content,
                         Err(error) => {
+                            let stop_ev = self
+                                .failed_session_stop_event(&resolved_sid, usage, error.to_string())
+                                .await;
+                            if let Err(storage_error) = persist_event(self.storage.as_ref(), &stop_ev).await {
+                                yield Err(storage_error);
+                                return;
+                            }
                             yield Err(error);
                             return;
                         }
@@ -924,10 +946,24 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                             let v: Value = match serde_json::from_str(&tc.arguments) {
                                 Ok(value) => value,
                                 Err(error) => {
-                                    yield Err(AgentError::RunError(format!(
+                                    let run_error = AgentError::RunError(format!(
                                         "Tool {} returned invalid JSON arguments: {error}",
                                         tc.name
-                                    )));
+                                    ));
+                                    usage.latency =
+                                        (Utc::now() - start_processing).num_milliseconds();
+                                    let stop_ev = self
+                                        .failed_session_stop_event(
+                                            &resolved_sid,
+                                            usage,
+                                            run_error.to_string(),
+                                        )
+                                        .await;
+                                    if let Err(storage_error) = persist_event(self.storage.as_ref(), &stop_ev).await {
+                                        yield Err(storage_error);
+                                        return;
+                                    }
+                                    yield Err(run_error);
                                     return;
                                 }
                             };
@@ -1046,9 +1082,23 @@ impl<Ctx: Send + Sync + 'static> Agent for MicroAgent<Ctx> {
                                     format!("Tool failed: {r}")
                                 },
                                 _ => {
-                                    yield Err(AgentError::RunError(
+                                    let run_error = AgentError::RunError(
                                         "Tool returned an unsupported result".to_string(),
-                                    ));
+                                    );
+                                    usage.latency =
+                                        (Utc::now() - start_processing).num_milliseconds();
+                                    let stop_ev = self
+                                        .failed_session_stop_event(
+                                            &resolved_sid,
+                                            usage,
+                                            run_error.to_string(),
+                                        )
+                                        .await;
+                                    if let Err(storage_error) = persist_event(self.storage.as_ref(), &stop_ev).await {
+                                        yield Err(storage_error);
+                                        return;
+                                    }
+                                    yield Err(run_error);
                                     return;
                                 }
                             };
@@ -1339,6 +1389,45 @@ mod tests {
         assert!(
             matches!(error, AgentError::RunError(message) if message.contains("updating the session"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_failed_session_stop_event_records_error_and_incomplete_tasks() {
+        let agent = MicroAgent {
+            history: vec![],
+            tools: HashMap::new(),
+            skills: HashMap::new(),
+            provider: SupportedProvider::OpenAI,
+            base_url: None,
+            model: "test-model".to_string(),
+            system: "test-system".to_string(),
+            api_key: "test-key".to_string(),
+            client: Arc::new(LLM::default()),
+            tool_context: Arc::new(ToolExecutionContext::new(())),
+            storage: Box::new(InMemoryAgentStorage::default()),
+            parallel_tool_calls: false,
+            tasks: Arc::new(Mutex::new(HashMap::from([(
+                "unfinished".to_string(),
+                TaskStatus::InProgress,
+            )]))),
+            prompt_cache: false,
+        };
+
+        let event = agent
+            .failed_session_stop_event("session-1", Usage::default(), "run failed".to_string())
+            .await;
+
+        assert!(matches!(
+            event,
+            AgentEventAny::SessionStop(SessionStopEvent {
+                session_id,
+                success: false,
+                result: None,
+                error: Some(error),
+                incomplete_tasks: Some(tasks),
+                ..
+            }) if session_id == "session-1" && error == "run failed" && tasks == ["unfinished"]
+        ));
     }
 
     #[tokio::test]
