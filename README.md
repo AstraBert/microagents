@@ -1,3 +1,5 @@
+> _I moved this project to [lightagent](https://github.com/AstraBert/lightagent)_
+
 # microagents
 
 A minimal, modular AI-agent framework written in Rust. It provides a small core library, pluggable storage backends, an event-driven architecture, and a batteries-included CLI with an embedded TUI.
